@@ -136,6 +136,11 @@ def get_cpu_memory() -> int:
     return psutil.virtual_memory().total
 
 
+def get_gpu_memory(gpu: int = 0) -> int:
+    """Returns the total memory of the GPU in bytes."""
+    return torch.cuda.get_device_properties(gpu).total_memory
+
+
 def random_uuid() -> str:
     return str(uuid.uuid4().hex)
 
