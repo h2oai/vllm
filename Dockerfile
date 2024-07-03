@@ -4,6 +4,7 @@
 # Please update any changes made here to
 # docs/source/dev/dockerfile/dockerfile.rst and
 # docs/source/assets/dev/dockerfile-stages-dependency.png
+ARG WOLFI_OS_BASE_IMAGE=none
 
 ARG CUDA_VERSION=12.4.1
 #################### BASE BUILD IMAGE ####################
