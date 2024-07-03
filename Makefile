@@ -17,3 +17,4 @@ docker_build:
 
 docker_push:
 	docker tag $(DOCKER_TEST_IMAGE_VLLM) gcr.io/vorvan/h2oai/h2ogpte-vllm:$(VERSION)
+	docker push gcr.io/vorvan/h2oai/h2ogpte-vllm:$(VERSION)
