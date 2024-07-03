@@ -11,7 +11,7 @@ VLLM_BASE_IMAGE   ?= gcr.io/vorvan/h2oai/h2ogpt-vllm-wolfi-base:1
 
 docker_build:
 	docker pull $(VLLM_BASE_IMAGE)
-	DOCKER_BUILDKIT=1 docker build --load --build-arg max_jobs=$(NPROCS) --build-arg PYTHON_VERSION=3.10 --build-arg CUDA_VERSION=$(VLLM_CUDA_VERSION) --build-arg WOLFI_OS_BASE_IMAGE=$(VLLM_BASE_IMAGE) --tag $(DOCKER_TEST_IMAGE_VLLM) --file Dockerfile .
+	docker buildx build --load --build-arg max_jobs=$(NPROCS) --build-arg PYTHON_VERSION=3.10 --build-arg CUDA_VERSION=$(VLLM_CUDA_VERSION) --build-arg WOLFI_OS_BASE_IMAGE=$(VLLM_BASE_IMAGE) --tag $(DOCKER_TEST_IMAGE_VLLM) --file Dockerfile .
 
 docker_push:
 	docker tag $(DOCKER_TEST_IMAGE_VLLM) gcr.io/vorvan/h2oai/h2ogpte-vllm:$(VERSION)
