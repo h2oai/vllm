@@ -1,4 +1,5 @@
 
+NPROCS                     := $(shell nproc)
 VERSION                    := $(shell grep -oP '(?<=__version__ = ")[^"]*' vllm/version.py)
 DOCKER_TEST_IMAGE_VLLM     := harbor.h2o.ai/h2ogpt/test-image-vllm:$(VERSION)
 
