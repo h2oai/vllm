@@ -197,6 +197,8 @@ ENV VLLM_USAGE_SOURCE=production-docker-image
 ENV VLLM_NCCL_SO_PATH=/usr/lib/python3.10/site-packages/nvidia/nccl/lib/libnccl.so.2
 ENV NUMBA_CACHE_DIR=/workspace/numba_cache
 ENV HOME=/workspace
+ENV VLLM_NO_USAGE_STATS=1
+ENV DO_NOT_TRACK=1
 RUN mkdir -p ${NUMBA_CACHE_DIR}
 RUN chmod -R a+rwx /workspace
 
