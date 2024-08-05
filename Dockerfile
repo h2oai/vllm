@@ -196,6 +196,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 ENV VLLM_USAGE_SOURCE=production-docker-image
 ENV VLLM_NCCL_SO_PATH=/usr/lib/python3.10/site-packages/nvidia/nccl/lib/libnccl.so.2
 ENV NUMBA_CACHE_DIR=/workspace/numba_cache
+ENV HOME=/workspace
 RUN mkdir -p ${NUMBA_CACHE_DIR}
 RUN chmod -R a+rwx /workspace
 
