@@ -194,7 +194,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install accelerate hf_transfer 'modelscope!=1.15.0'
 
 ENV VLLM_USAGE_SOURCE=production-docker-image
-ENV VLLM_NCCL_SO_PATH=/usr/lib/python3.10/site-packages/nvidia/nccl/lib/libnccl.so.2
+ENV VLLM_NCCL_SO_PATH=/usr/lib/libnccl.so
 ENV NUMBA_CACHE_DIR=/workspace/numba_cache
 ENV HOME=/workspace
 ENV VLLM_NO_USAGE_STATS=1
