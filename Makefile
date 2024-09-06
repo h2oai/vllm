@@ -8,7 +8,7 @@ ifeq ($(VERSION),)
 endif
 
 VLLM_CUDA_VERSION ?= 12.1.0
-VLLM_BASE_IMAGE   ?= gcr.io/vorvan/h2oai/h2ogpt-vllm-wolfi-base:2
+VLLM_BASE_IMAGE   ?= gcr.io/vorvan/h2oai/h2ogpt-vllm-wolfi-base:3
 
 docker_build:
 	docker pull $(VLLM_BASE_IMAGE)
