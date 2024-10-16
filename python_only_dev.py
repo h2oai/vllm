@@ -49,14 +49,14 @@ files_to_copy = [
 
 # Try to create _version.py to avoid version related warning
 # Refer to https://github.com/vllm-project/vllm/pull/8771
-try:
-    from setuptools_scm import get_version
-    get_version(write_to="vllm/_version.py")
-except ImportError:
-    warnings.warn(
-        "To avoid warnings related to vllm._version, "
-        "you should install setuptools-scm by `pip install setuptools-scm`",
-        stacklevel=2)
+# try:
+#     from setuptools_scm import get_version
+#     get_version(write_to="vllm/_version.py")
+# except ImportError:
+#     warnings.warn(
+#         "To avoid warnings related to vllm._version, "
+#         "you should install setuptools-scm by `pip install setuptools-scm`",
+#         stacklevel=2)
 
 if not args.quit_dev:
     for file in files_to_copy:
