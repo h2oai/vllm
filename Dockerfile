@@ -157,7 +157,6 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/workspace/dist \
     python3 -m pip install dist/*.whl --verbose
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    . /etc/environment && \
     python3 -m pip install https://github.com/flashinfer-ai/flashinfer/releases/download/v0.1.6/flashinfer-0.1.6+cu121torch2.4-cp310-cp310-linux_x86_64.whl
 #################### vLLM installation IMAGE ####################
 
