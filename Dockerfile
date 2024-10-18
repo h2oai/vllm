@@ -76,6 +76,9 @@ ARG GIT_REPO_CHECK=0
 RUN --mount=type=bind,source=.git,target=.git \
     if [ "$GIT_REPO_CHECK" != 0 ]; then bash tools/check_repo.sh ; fi
 
+# set version explicitly
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.6.3.post1
+
 # max jobs used by Ninja to build extensions
 ARG max_jobs=2
 ENV MAX_JOBS=${max_jobs}
