@@ -73,6 +73,9 @@ COPY requirements-cuda.txt requirements-cuda.txt
 COPY pyproject.toml pyproject.toml
 COPY vllm vllm
 
+# set version explicitly
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.6.2
+
 # max jobs used by Ninja to build extensions
 ARG max_jobs=2
 ENV MAX_JOBS=${max_jobs}
