@@ -22,7 +22,7 @@ copyright their authors):
   with the readout at each row's own last position.
 
 vLLM serves the same checkpoint under the pooling runner (``--convert embed``,
-LAST pooling, no normalisation) with ``noncausal_full_attention`` declared; the
+LAST pooling, no activation/normalisation) with ``noncausal_full_attention`` declared; the
 test computes the same letter logits from the pooled hidden state and the
 checkpoint's ``lm_head`` rows (``LinneEngine`` does exactly this, in process).
 
@@ -48,6 +48,7 @@ import sys
 import pytest
 import torch
 
+from vllm.config import PoolerConfig
 from vllm.distributed import cleanup_dist_env_and_memory
 
 LINNE_REPO = "MISA-core/linne-oak-1-0"
@@ -139,7 +140,7 @@ def _vllm(vllm_runner, linne_dir, prompts, W, cap, noncausal):
         linne_dir,
         runner="pooling",
         convert="embed",
-        override_pooler_config={"pooling_type": "LAST", "normalize": False},
+        pooler_config=PoolerConfig(task="embed", seq_pooling_type="LAST", use_activation=False),
         hf_overrides=hf_overrides,
         max_model_len=8192,
         enable_prefix_caching=False,

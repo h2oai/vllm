@@ -9,7 +9,7 @@ sliding-window layers keep their causal window mask. The readout is the one a
 decision shim makes: the last token's hidden state against the ``lm_head``
 rows of a few label tokens, Gemma's final logit softcap applied, softmax over
 the labels. vLLM serves the model under the pooling runner (``--convert embed``,
-LAST pooling, no normalisation) and must give the same label distributions.
+LAST pooling, no activation/normalisation) and must give the same label distributions.
 
 Also checked: WITHOUT the declaration the same pooling readout equals the
 causal transformers forward, so stock behaviour is unchanged.
@@ -18,6 +18,7 @@ causal transformers forward, so stock behaviour is unchanged.
 import pytest
 import torch
 
+from vllm.config import PoolerConfig
 from vllm.distributed import cleanup_dist_env_and_memory
 
 MODEL = "google/gemma-4-E4B-it"  # 42 layers, 7 full-attention, 18 KV-shared
@@ -102,7 +103,7 @@ def _vllm_label_probs(vllm_runner, model_name, prompts, W, cap, noncausal):
         model_name,
         runner="pooling",
         convert="embed",
-        override_pooler_config={"pooling_type": "LAST", "normalize": False},
+        pooler_config=PoolerConfig(task="embed", seq_pooling_type="LAST", use_activation=False),
         hf_overrides=hf_overrides,
         max_model_len=2048,
         enable_prefix_caching=False,
