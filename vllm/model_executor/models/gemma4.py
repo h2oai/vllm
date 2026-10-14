@@ -36,7 +36,7 @@ from vllm.distributed import (
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_and_mul_fn
-from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention import Attention, EncoderOnlyAttention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     GateLinear,
@@ -65,6 +65,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.gemma4 import gemma4_layer_config
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.utils import KVSharingFastPrefillMetadata
 
 from .interfaces import (
@@ -220,6 +221,44 @@ def _get_text_config(config):
     if hasattr(config, "text_config"):
         return config.text_config
     return config
+
+
+def noncausal_full_attention(config) -> bool:
+    """Whether the full-attention (global) layers read the prompt in both
+    directions. Driven by the text config's ``is_causal`` (set to False by a
+    checkpoint, by ``--hf-overrides '{"text_config": {"is_causal": false}}'``
+    or by ``Gemma4Config.verify_and_update_model_config`` from
+    ``noncausal_full_attention``). Absent, the model is causal everywhere, as
+    before. Sliding-window layers are never affected."""
+    return not getattr(config, "is_causal", True)
+
+
+def noncausal_layer_plan(config) -> list[dict[str, object]]:
+    """One entry per layer: ``{"layer_type", "noncausal", "kv_source"}``.
+
+    ``noncausal`` is True on the full-attention layers of a non-causal model;
+    ``kv_source`` is the index of the earlier layer whose K/V a KV-shared layer
+    (the last ``num_kv_shared_layers`` layers) reads, else None. A KV-shared
+    non-causal layer takes its K/V from the source layer's forward directly
+    (there is no KV cache to read from under EncoderOnlyAttention)."""
+    layer_types = list(config.layer_types)
+    num_shared = getattr(config, "num_kv_shared_layers", 0) or 0
+    first_shared = config.num_hidden_layers - num_shared
+    noncausal = noncausal_full_attention(config)
+    plan: list[dict[str, object]] = []
+    for idx, layer_type in enumerate(layer_types[: config.num_hidden_layers]):
+        source = None
+        if num_shared > 0 and idx >= first_shared:
+            prev = layer_types[:first_shared]
+            source = len(prev) - 1 - prev[::-1].index(layer_type)
+        plan.append(
+            {
+                "layer_type": layer_type,
+                "noncausal": noncausal and layer_type == "full_attention",
+                "kv_source": source,
+            }
+        )
+    return plan
 
 
 class Gemma4MLP(nn.Module):
@@ -463,6 +502,13 @@ class Gemma4Attention(nn.Module):
         layer_type = config.layer_types[layer_idx]
         self.is_sliding = layer_type == "sliding_attention"
         sliding_window = config.sliding_window if self.is_sliding else None
+        # Non-causal full-attention layers (config.is_causal False): the
+        # global layers read the whole prompt in both directions and keep no
+        # KV cache; the sliding layers stay causal.
+        self.noncausal = noncausal_full_attention(config) and not self.is_sliding
+        # A KV-shared non-causal layer reads the source layer's K/V from the
+        # forward's `noncausal_shared_kv` dict (no cache to share).
+        self.noncausal_kv_source: str | None = None
 
         # Initialize RoPE based on layer type.
         # Gemma4 uses different RoPE parameters for sliding vs full attention.
@@ -504,6 +550,12 @@ class Gemma4Attention(nn.Module):
                     f"{param_name_before_layers}.layers."
                     f"{kv_shared_layer_index}.self_attn.attn"
                 )
+                if self.noncausal:
+                    # EncoderOnlyAttention has no KV cache for the backend to
+                    # share: the source layer's K/V are handed over in the
+                    # forward instead (see Gemma4Attention.forward).
+                    self.noncausal_kv_source = kv_sharing_target_layer_name
+                    kv_sharing_target_layer_name = None
 
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -512,13 +564,20 @@ class Gemma4Attention(nn.Module):
             is_neox_style=True,
         )
 
-        self.attn = Attention(
+        # Mirrors gemma3.py / qwen3_next.py: a non-causal full-attention
+        # layer is an EncoderOnlyAttention (bidirectional, no KV cache).
+        attn_cls = EncoderOnlyAttention if self.noncausal else Attention
+        attn_type = (
+            AttentionType.ENCODER_ONLY if self.noncausal else AttentionType.DECODER
+        )
+        self.attn = attn_cls(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             cache_config=cache_config,
             quant_config=quant_config,
+            attn_type=attn_type,
             logits_soft_cap=attn_logits_soft_cap,
             per_layer_sliding_window=sliding_window,
             kv_sharing_target_layer_name=kv_sharing_target_layer_name,
@@ -538,6 +597,7 @@ class Gemma4Attention(nn.Module):
         hidden_states: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        shared_kv = kwargs.get("noncausal_shared_kv")
         if self.is_kv_shared_layer:
             # Shared KV: only Q is projected; K/V come from the target layer.
             q, _ = self.q_proj(hidden_states)
@@ -545,7 +605,18 @@ class Gemma4Attention(nn.Module):
             q = self.q_norm(q)
             q = q.flatten(-2, -1)
             q, _ = self.rotary_emb(positions, q, None)
-            attn_output = self.attn(q, None, None)
+            if self.noncausal:
+                # No KV cache under EncoderOnlyAttention: the source layer's
+                # K/V of this forward, stored below, are attended directly.
+                if shared_kv is None or self.noncausal_kv_source not in shared_kv:
+                    raise RuntimeError(
+                        f"{self.attn.layer_name}: non-causal KV-shared layer "
+                        f"without its source {self.noncausal_kv_source}"
+                    )
+                k, v = shared_kv[self.noncausal_kv_source]
+                attn_output = self.attn(q, k, v)
+            else:
+                attn_output = self.attn(q, None, None)
         else:
             # For k_eq_v, K weights are loaded into both K and V slots of
             # qkv_proj, so V == K automatically.
@@ -564,6 +635,9 @@ class Gemma4Attention(nn.Module):
             v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
             v = self.v_norm(v)
             v = v.flatten(-2, -1)
+            if self.noncausal and shared_kv is not None:
+                # Kept for the KV-shared non-causal layers of this forward.
+                shared_kv[self.attn.layer_name] = (k, v)
             attn_output = self.attn(q, k, v)
 
         output, _ = self.o_proj(attn_output)
@@ -1131,6 +1205,13 @@ class Gemma4Model(nn.Module, EagleModelMixin):
             )
 
         self.fast_prefill_enabled = cache_config.kv_sharing_fast_prefill
+        # Non-causal full attention with KV-shared layers: the forward carries
+        # the source layers' K/V in a dict (no KV cache under
+        # EncoderOnlyAttention). Fast prefill is refused for it in
+        # Gemma4Config.verify_and_update_config.
+        self.noncausal_shared_kv = noncausal_full_attention(config) and (
+            getattr(config, "num_kv_shared_layers", 0) or 0
+        ) > 0
 
         if self.fast_prefill_enabled:
             # Allocate static buffers for CUDAGraph
@@ -1348,6 +1429,8 @@ class Gemma4Model(nn.Module, EagleModelMixin):
             if per_layer_inputs is not None:
                 per_layer_inputs = intermediate_tensors["per_layer_inputs"]
         residual = None
+        if self.noncausal_shared_kv:
+            kwargs["noncausal_shared_kv"] = {}
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for layer_idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)

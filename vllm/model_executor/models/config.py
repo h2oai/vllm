@@ -208,6 +208,49 @@ class UnlimitedOCRForCausalLMConfig(VerifyAndUpdateConfig):
 
 class Gemma4Config(VerifyAndUpdateConfig):
     @staticmethod
+    def verify_and_update_model_config(model_config: "ModelConfig") -> None:
+        """Apply a non-causal full-attention declaration, if any.
+
+        A checkpoint (or ``--hf-overrides``) that sets
+        ``noncausal_full_attention: true`` or ``is_causal: false`` on the text
+        config makes the full-attention layers read the prompt in both
+        directions (``EncoderOnlyAttention``, no KV cache); the sliding-window
+        layers stay causal. Absent, nothing changes: the model is causal
+        everywhere, as before. Such a model is served by the pooling runner,
+        whose ``attn_type`` becomes ``encoder_only`` and which then turns off
+        chunked prefill and prefix caching (both would feed the bidirectional
+        layers a partial prompt). The generate runner is refused.
+        """
+        configs = {
+            id(config): config
+            for config in (model_config.hf_config, model_config.hf_text_config)
+        }
+        declared = [
+            bool(flag)
+            for config in configs.values()
+            if (flag := getattr(config, "noncausal_full_attention", None)) is not None
+        ]
+        if len(set(declared)) > 1:
+            raise ValueError(
+                "conflicting noncausal_full_attention declarations on the "
+                "Gemma4 config and its text config"
+            )
+        noncausal = (declared and declared[0]) or any(
+            not getattr(config, "is_causal", True) for config in configs.values()
+        )
+        if not noncausal:
+            return
+        for config in configs.values():
+            config.is_causal = False
+        if model_config.runner_type != "pooling":
+            raise ValueError(
+                "Gemma4 with non-causal full attention needs the pooling runner "
+                "(--runner pooling --convert embed): the generate runner would "
+                "prefix-cache or chunk the prompt the bidirectional layers must "
+                "see whole"
+            )
+
+    @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         """Configure attention for heterogeneous head dimensions.
 
@@ -220,6 +263,14 @@ class Gemma4Config(VerifyAndUpdateConfig):
         to Triton.
         """
         model_config = vllm_config.model_config
+        if not getattr(model_config.hf_text_config, "is_causal", True) and (
+            vllm_config.cache_config.kv_sharing_fast_prefill
+        ):
+            raise ValueError(
+                "kv_sharing_fast_prefill is not supported with Gemma4 non-causal "
+                "full attention (its KV-shared layers take K/V from the source "
+                "layer's forward, not from a cache)"
+            )
         arch_config = model_config.model_arch_config
         layer_types = getattr(model_config.hf_text_config, "layer_types", None) or []
         head_dims = {
