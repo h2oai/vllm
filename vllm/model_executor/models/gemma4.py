@@ -229,7 +229,14 @@ def noncausal_full_attention(config) -> bool:
     checkpoint, by ``--hf-overrides '{"text_config": {"is_causal": false}}'``
     or by ``Gemma4Config.verify_and_update_model_config`` from
     ``noncausal_full_attention``). Absent, the model is causal everywhere, as
-    before. Sliding-window layers are never affected."""
+    before. Sliding-window layers are never affected.
+
+    The definition is the one such checkpoints train with (e.g. the Apache-2.0
+    MISA-core/linne-oak-1-0 runtime, ``nc_hook.py``: the ``full_attention``
+    mask becomes the padding mask, so nothing but padding is hidden; the
+    sliding and linear layers keep their masks; the readout stays at the last
+    prompt position). vLLM runs prompts unpadded, so the equivalent is an
+    ``EncoderOnlyAttention`` on exactly those layers."""
     return not getattr(config, "is_causal", True)
 
 
