@@ -198,3 +198,22 @@ def test_silent_causal_guard_raises_on_a_bidirectional_build_without_the_declara
     ]
     with pytest.raises(RuntimeError, match="0 full-attention layers should be bidirectional, 10 are"):
         assert_noncausal_layers(_fake_model(G31_LAYER_TYPES, built), stock)
+
+
+@pytest.mark.cpu_test
+def test_triton_prefill_block_size_shrinks_for_wide_heads():
+    """The encoder-only (bidirectional) path of the Triton backend runs the
+    full-attention layers through context_attention_fwd; at head_dim 512 the
+    default block (128 on Ampere+) needs ~288 KB of shared memory and fails on
+    every current card. Wide heads take BLOCK 32 (~74 KB); narrow ones are
+    unchanged."""
+    import torch
+
+    from vllm.v1.attention.ops import triton_prefill_attention as T
+
+    for dtype in (torch.bfloat16, torch.float16, torch.float32):
+        assert T.wide_head_block_size(dtype, 256) == T.get_block_size(dtype)
+        assert T.wide_head_block_size(dtype, 512) == min(32, T.get_block_size(dtype))
+        assert T.wide_head_block_size(dtype, 512) * 2304 < 101_376   # the L40S / RTX PRO 6000 limit
+    src = open(T.__file__).read()
+    assert "BLOCK = wide_head_block_size(q.dtype, Lk)" in src
