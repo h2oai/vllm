@@ -20,6 +20,7 @@ layers). A near-tie row (margin < 0.05) amplifies logit noise into |dp|; judge a
 """
 
 import argparse
+import gc
 import json
 import os
 import sys
@@ -61,6 +62,12 @@ def vllm_probs(model_name, prompts, W, cap, backend):
     from vllm import LLM
     from vllm.config import PoolerConfig
 
+    # the HF models' blocks stay cached in this process: release them, and ask vLLM for a share that fits what is
+    # left (the first run refused to start at 0.92 utilisation with 23 of 44 GiB free)
+    gc.collect()
+    torch.cuda.empty_cache()
+    free, total = torch.cuda.mem_get_info()
+    print(f"free before vLLM ({backend}): {free / 2**30:.1f} of {total / 2**30:.1f} GiB")
     llm = LLM(
         model=model_name,
         runner="pooling",
@@ -71,6 +78,7 @@ def vllm_probs(model_name, prompts, W, cap, backend):
         max_model_len=2048,
         enable_prefix_caching=False,
         dtype="bfloat16",
+        gpu_memory_utilization=float(os.environ.get("DIAG_GPU_MEM", "0.6")),
     )
     outs = llm.embed(prompts, use_tqdm=False)
     h = torch.stack([torch.tensor(o.outputs.embedding) for o in outs]).float()
