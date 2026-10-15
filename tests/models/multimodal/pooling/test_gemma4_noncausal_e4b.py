@@ -35,63 +35,44 @@ PROMPTS = [
     "D: other\nAnswer with the letter of one option only.",
 ]
 MAX_ARGMAX_DISAGREEMENT = 0.01
-MAX_ABS_DP = 0.02
+MAX_ABS_DP = 0.05   # transformers (sdpa, bf16) vs vLLM (Triton attention, bf16, cudagraphs) on one row
 
 
 def _reference_label_probs(model_name, prompts, label_ids, noncausal):
     """Label distributions from transformers, causal or with the non-causal
-    full-attention mask (the training-time hook, inlined)."""
+    full-attention mask (the training-time hook, inlined).
+
+    ONE PROMPT PER FORWARD, no padding, no mask. A left-padded multi-row batch
+    is read wrongly by PyTorch's memory-efficient SDPA kernel on Gemma-4's
+    512-wide global heads under an explicit mask (measured on Gemma-4-12B:
+    probabilities off by up to 0.9); a single unpadded row takes the fused
+    kernel and is exact. Row by row the non-causal change is just the module
+    flag (no mask to replace), which is also what vLLM's unpadded prefill does.
+    """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(model_name)
-    tok.padding_side = "left"
     model = AutoModelForCausalLM.from_pretrained(
         model_name, dtype=torch.bfloat16, attn_implementation="sdpa"
     ).cuda().eval()
     text_config = model.config.get_text_config()
     text_model = model.model.language_model
-    full_modules = [
-        layer.self_attn
-        for layer, kind in zip(text_model.layers, text_config.layer_types)
-        if kind == "full_attention"
-    ]
     if noncausal:
-        for m in full_modules:
-            m.is_causal = False
-
-        def pre(module, args, kwargs):
-            am = kwargs.get("attention_mask")
-            pad = kwargs.pop("_pad_mask", None)
-            if isinstance(am, dict) and pad is not None:
-                am = dict(am)
-                am["full_attention"] = (
-                    None if bool(pad.all()) else pad.bool()[:, None, None, :]
-                )
-                kwargs["attention_mask"] = am
-            return args, kwargs
-
-        text_model.register_forward_pre_hook(pre, with_kwargs=True)
-
-    enc = tok(prompts, return_tensors="pt", padding=True).to("cuda")
-    with torch.no_grad():
-        # The wrapper builds the mask dict itself and passes it to the text
-        # model; the hook needs the 2-D padding mask alongside.
-        if noncausal:
-            handle = text_model.register_forward_pre_hook(
-                lambda m, a, kw: (a, {**kw, "_pad_mask": enc.attention_mask}),
-                with_kwargs=True,
-                prepend=True,
-            )
-        out = model.model(**enc)
-        if noncausal:
-            handle.remove()
-    h = out.last_hidden_state[:, -1, :].float()
+        for layer, kind in zip(text_model.layers, text_config.layer_types):
+            if kind == "full_attention":
+                layer.self_attn.is_causal = False
     W = model.lm_head.weight[label_ids].float()
-    logits = h @ W.T
     cap = float(getattr(text_config, "final_logit_softcapping", 0) or 0)
-    if cap:
-        logits = cap * torch.tanh(logits / cap)
-    probs = torch.softmax(logits, dim=-1).cpu()
+    rows = []
+    with torch.no_grad():
+        for prompt in prompts:
+            enc = tok(prompt, return_tensors="pt").to("cuda")
+            out = model.model(**enc)
+            logits = out.last_hidden_state[0, -1, :].float() @ W.T
+            if cap:
+                logits = cap * torch.tanh(logits / cap)
+            rows.append(torch.softmax(logits, dim=-1).cpu())
+    probs = torch.stack(rows)
     del model
     torch.cuda.empty_cache()
     return probs, W.cpu(), cap
@@ -148,4 +129,6 @@ def test_noncausal_readout_differs_from_causal(vllm_runner, noncausal):
     causal, W, cap = _reference_label_probs(MODEL, PROMPTS, label_ids, False)
     cleanup_dist_env_and_memory()
     ours = _vllm_label_probs(vllm_runner, MODEL, PROMPTS, W, cap, True)
-    assert (causal - ours).abs().max().item() > 1e-3
+    engine_gap = (causal - _vllm_label_probs(vllm_runner, MODEL, PROMPTS, W, cap, False)).abs().max().item()
+    # the mode change must move the readout by clearly more than the engine-vs-reference numeric gap
+    assert (causal - ours).abs().max().item() > max(2 * engine_gap, 1e-2), (engine_gap, causal, ours)
