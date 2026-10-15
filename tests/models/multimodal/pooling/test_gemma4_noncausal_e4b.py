@@ -45,6 +45,24 @@ MAX_MEAN_DP = 0.01
 CLEAR_MARGIN = 0.05
 
 
+def _load_reference(model_name, dtype):
+    """transformers Gemma-4 with SDPA on the TEXT stack only: the audio tower refuses SDPA on some transformers
+    versions ("Gemma4AudioModel does not support an attention implementation through sdpa yet"), so the towers get
+    eager (they are not exercised: text prompts) and the language model SDPA, which is the kernel the hook relies on."""
+    from transformers import AutoModelForCausalLM
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name, dtype=dtype,
+            attn_implementation={"text_config": "sdpa", "vision_config": "eager", "audio_config": "eager"},
+        )
+    except (ValueError, TypeError):
+        model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype, attn_implementation="eager")
+        model.model.language_model.set_attn_implementation("sdpa")
+    assert model.model.language_model.config._attn_implementation == "sdpa"
+    return model.cuda().eval()
+
+
 def _reference_label_probs(model_name, prompts, label_ids, noncausal):
     """Label distributions from transformers, causal or with the non-causal
     full-attention mask (the training-time hook, inlined).
@@ -56,12 +74,10 @@ def _reference_label_probs(model_name, prompts, label_ids, noncausal):
     kernel and is exact. Row by row the non-causal change is just the module
     flag (no mask to replace), which is also what vLLM's unpadded prefill does.
     """
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name, dtype=torch.float32, attn_implementation="sdpa"   # the fp32 anchor (E4B: ~32 GB, fits an L40S)
-    ).cuda().eval()
+    model = _load_reference(model_name, torch.float32)   # the fp32 anchor (E4B: ~32 GB, fits an L40S)
     text_config = model.config.get_text_config()
     text_model = model.model.language_model
     if noncausal:

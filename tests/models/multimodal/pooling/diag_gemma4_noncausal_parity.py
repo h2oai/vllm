@@ -33,11 +33,29 @@ from test_gemma4_noncausal_e4b import LABELS, PROMPTS  # noqa: E402
 MARGIN = 0.05
 
 
+def _load_reference(model_name, dtype):
+    """transformers Gemma-4 with SDPA on the TEXT stack only: the audio tower refuses SDPA on some transformers
+    versions ("Gemma4AudioModel does not support an attention implementation through sdpa yet"), so the towers get
+    eager (they are not exercised: text prompts) and the language model SDPA, which is the kernel the hook relies on."""
+    from transformers import AutoModelForCausalLM
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name, dtype=dtype,
+            attn_implementation={"text_config": "sdpa", "vision_config": "eager", "audio_config": "eager"},
+        )
+    except (ValueError, TypeError):
+        model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype, attn_implementation="eager")
+        model.model.language_model.set_attn_implementation("sdpa")
+    assert model.model.language_model.config._attn_implementation == "sdpa"
+    return model.cuda().eval()
+
+
 def hf_probs(model_name, prompts, label_ids, noncausal, dtype):
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype, attn_implementation="sdpa").cuda().eval()
+    model = _load_reference(model_name, dtype)
     tc = model.config.get_text_config()
     tm = model.model.language_model
     if noncausal:
