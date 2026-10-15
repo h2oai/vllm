@@ -75,7 +75,7 @@ def vllm_probs(model_name, prompts, W, cap, backend):
         pooler_config=PoolerConfig(task="embed", seq_pooling_type="LAST", use_activation=False),
         hf_overrides={"text_config": {"noncausal_full_attention": True}},
         attention_backend=backend,
-        max_model_len=2048,
+        max_model_len=int(os.environ.get("DIAG_MAX_LEN", "8192")),
         enable_prefix_caching=False,
         dtype="bfloat16",
         gpu_memory_utilization=float(os.environ.get("DIAG_GPU_MEM", "0.6")),

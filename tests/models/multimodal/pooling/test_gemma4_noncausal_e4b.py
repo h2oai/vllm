@@ -35,14 +35,21 @@ PROMPTS = [
     "D: other\nAnswer with the letter of one option only.",
 ]
 MAX_ARGMAX_DISAGREEMENT = 0.01
-MAX_ABS_DP = 0.05   # transformers (sdpa, bf16) vs vLLM (Triton attention, bf16, cudagraphs) on one row
+# Tolerances from the measured drift (bidir-test2, 2026-10-15, 20 DI dev prompts, E4B): transformers bf16 itself sits
+# max 0.136 / mean 0.005 from transformers fp32; vLLM (Triton encoder path, BLOCK 32 on the 512-wide heads, bf16,
+# cudagraphs) sits max 0.089 / mean 0.004 from fp32, i.e. closer than the bf16 reference; argmax agreed on all 19
+# rows with a top-2 margin >= 0.05. So the reference is fp32 (the anchor), the max-|dp| bound is 0.10 (near ties
+# amplify ~0.3-logit bf16 noise), the mean bound 0.01, and argmax is judged on clear rows only.
+MAX_ABS_DP = 0.10
+MAX_MEAN_DP = 0.01
+CLEAR_MARGIN = 0.05
 
 
 def _reference_label_probs(model_name, prompts, label_ids, noncausal):
     """Label distributions from transformers, causal or with the non-causal
     full-attention mask (the training-time hook, inlined).
 
-    ONE PROMPT PER FORWARD, no padding, no mask. A left-padded multi-row batch
+    ONE PROMPT PER FORWARD, no padding, no mask, in fp32. A left-padded multi-row batch
     is read wrongly by PyTorch's memory-efficient SDPA kernel on Gemma-4's
     512-wide global heads under an explicit mask (measured on Gemma-4-12B:
     probabilities off by up to 0.9); a single unpadded row takes the fused
@@ -53,7 +60,7 @@ def _reference_label_probs(model_name, prompts, label_ids, noncausal):
 
     tok = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, dtype=torch.bfloat16, attn_implementation="sdpa"
+        model_name, dtype=torch.float32, attn_implementation="sdpa"   # the fp32 anchor (E4B: ~32 GB, fits an L40S)
     ).cuda().eval()
     text_config = model.config.get_text_config()
     text_model = model.model.language_model
@@ -112,9 +119,11 @@ def test_gemma4_pooling_readout_matches_transformers(vllm_runner, noncausal):
     cleanup_dist_env_and_memory()
     ours = _vllm_label_probs(vllm_runner, MODEL, PROMPTS, W, cap, noncausal)
 
-    disagreement = (ref.argmax(-1) != ours.argmax(-1)).float().mean().item()
+    clear = [r for r in range(len(PROMPTS)) if float(ref[r].topk(2).values.diff().abs()) >= CLEAR_MARGIN]
+    disagreement = sum(int(ref[r].argmax() != ours[r].argmax()) for r in clear) / max(len(clear), 1)
     assert disagreement <= MAX_ARGMAX_DISAGREEMENT, (ref, ours)
     assert (ref - ours).abs().max().item() <= MAX_ABS_DP, (ref, ours)
+    assert (ref - ours).abs().mean().item() <= MAX_MEAN_DP, (ref, ours)
 
 
 @pytest.mark.parametrize("noncausal", [True])
