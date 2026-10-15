@@ -206,6 +206,52 @@ class UnlimitedOCRForCausalLMConfig(VerifyAndUpdateConfig):
         text_config.rswa_window = rswa_window
 
 
+def apply_noncausal_declaration(model_config: "ModelConfig", family: str) -> bool:
+    """Mirror a non-causal full-attention declaration to BOTH the wrapper config
+    and the text config, and return whether one was made.
+
+    The attention code of the text stack reads ``is_causal`` from the TEXT
+    config (Qwen3Next/Qwen3.5 ``qwen3_next.py``, Gemma4). A flat
+    ``--hf-overrides '{"is_causal": false}'`` on a *ForConditionalGeneration
+    checkpoint lands on the wrapper config only, so the model silently stays
+    causal (measured on Qwen3.5-4B: 99.7 % of readouts equal to the causal
+    ones). Here either level (``noncausal_full_attention`` or ``is_causal``)
+    declares for both, and conflicting declarations are refused.
+    """
+    configs = {
+        id(config): config
+        for config in (model_config.hf_config, model_config.hf_text_config)
+    }
+    declared = [
+        bool(flag)
+        for config in configs.values()
+        if (flag := getattr(config, "noncausal_full_attention", None)) is not None
+    ]
+    if len(set(declared)) > 1:
+        raise ValueError(
+            f"conflicting noncausal_full_attention declarations on the {family} "
+            "config and its text config"
+        )
+    explicit_causal = [
+        config for config in configs.values()
+        if getattr(config, "is_causal", None) is True
+    ]
+    noncausal = (declared and declared[0]) or any(
+        getattr(config, "is_causal", None) is False for config in configs.values()
+    )
+    if not noncausal:
+        return False
+    if explicit_causal and not declared:
+        raise ValueError(
+            f"{family}: is_causal is False on one config and True on the other; "
+            "declare it once, e.g. --hf-overrides "
+            '\'{"text_config": {"noncausal_full_attention": true}}\''
+        )
+    for config in configs.values():
+        config.is_causal = False
+    return True
+
+
 class Gemma4Config(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
@@ -221,27 +267,8 @@ class Gemma4Config(VerifyAndUpdateConfig):
         chunked prefill and prefix caching (both would feed the bidirectional
         layers a partial prompt). The generate runner is refused.
         """
-        configs = {
-            id(config): config
-            for config in (model_config.hf_config, model_config.hf_text_config)
-        }
-        declared = [
-            bool(flag)
-            for config in configs.values()
-            if (flag := getattr(config, "noncausal_full_attention", None)) is not None
-        ]
-        if len(set(declared)) > 1:
-            raise ValueError(
-                "conflicting noncausal_full_attention declarations on the "
-                "Gemma4 config and its text config"
-            )
-        noncausal = (declared and declared[0]) or any(
-            not getattr(config, "is_causal", True) for config in configs.values()
-        )
-        if not noncausal:
+        if not apply_noncausal_declaration(model_config, "Gemma4"):
             return
-        for config in configs.values():
-            config.is_causal = False
         if model_config.runner_type != "pooling":
             raise ValueError(
                 "Gemma4 with non-causal full attention needs the pooling runner "
@@ -850,6 +877,16 @@ class Qwen3VLForSequenceClassificationConfig(Qwen3ForSequenceClassificationConfi
 
 
 class Qwen3_5ForConditionalGenerationConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_model_config(model_config: "ModelConfig") -> None:
+        """A non-causal declaration on either config level reaches the text
+        config the attention reads (a flat override was a silent no-op)."""
+        if apply_noncausal_declaration(model_config, "Qwen3.5"):
+            logger.info(
+                "Qwen3.5: non-causal full attention declared; the full-attention "
+                "layers run bidirectional (EncoderOnlyAttention), GDN layers causal"
+            )
+
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         """Update mamba_ssm_cache_dtype for Qwen3.5 models when set to 'auto'

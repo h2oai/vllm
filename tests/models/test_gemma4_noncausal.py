@@ -19,7 +19,13 @@ from transformers import PretrainedConfig
 from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
 
 from vllm.config import ModelConfig
-from vllm.model_executor.models.config import MODELS_CONFIG_MAP, Gemma4Config
+from vllm.model_executor.models.config import (
+    MODELS_CONFIG_MAP,
+    Gemma4Config,
+    Qwen3_5ForCausalLMConfig,
+    Qwen3_5ForConditionalGenerationConfig,
+    apply_noncausal_declaration,
+)
 from vllm.model_executor.models.gemma4 import (
     assert_noncausal_layers,
     noncausal_full_attention,
@@ -217,3 +223,41 @@ def test_triton_prefill_block_size_shrinks_for_wide_heads():
         assert T.wide_head_block_size(dtype, 512) * 2304 < 101_376   # the L40S / RTX PRO 6000 limit
     src = open(T.__file__).read()
     assert "BLOCK = wide_head_block_size(q.dtype, Lk)" in src
+
+
+@pytest.mark.cpu_test
+def test_flat_override_reaches_the_text_config_on_qwen35():
+    """The silent no-op (measured on Qwen3.5-4B: a flat is_causal=false on a
+    ForConditionalGeneration folder left hf_text_config.is_causal None, 99.7 %
+    of readouts equal to causal): the handler mirrors the declaration down."""
+    text = PretrainedConfig()
+    wrapper = PretrainedConfig(is_causal=False)
+    wrapper.text_config = text
+    assert getattr(text, "is_causal", None) is None
+    Qwen3_5ForConditionalGenerationConfig.verify_and_update_model_config(
+        _model_config(wrapper, text, runner_type="generate")
+    )
+    assert text.is_causal is False and wrapper.is_causal is False
+    # and the nested form, and the text-only class, behave the same
+    text2 = PretrainedConfig(noncausal_full_attention=True)
+    Qwen3_5ForCausalLMConfig.verify_and_update_model_config(_model_config(text2, runner_type="generate"))
+    assert text2.is_causal is False
+
+
+@pytest.mark.cpu_test
+def test_qwen35_without_a_declaration_is_untouched():
+    text = PretrainedConfig()
+    wrapper = PretrainedConfig()
+    wrapper.text_config = text
+    Qwen3_5ForConditionalGenerationConfig.verify_and_update_model_config(_model_config(wrapper, text))
+    assert not hasattr(text, "is_causal") and not hasattr(wrapper, "is_causal")
+    assert MODELS_CONFIG_MAP["Qwen3_5ForConditionalGeneration"] is Qwen3_5ForConditionalGenerationConfig
+
+
+@pytest.mark.cpu_test
+def test_contradictory_is_causal_levels_are_refused():
+    text = PretrainedConfig(is_causal=True)
+    wrapper = PretrainedConfig(is_causal=False)
+    wrapper.text_config = text
+    with pytest.raises(ValueError, match="declare it once"):
+        apply_noncausal_declaration(_model_config(wrapper, text), "Qwen3.5")
