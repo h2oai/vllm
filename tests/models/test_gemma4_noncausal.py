@@ -21,9 +21,11 @@ from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
 from vllm.config import ModelConfig
 from vllm.model_executor.models.config import MODELS_CONFIG_MAP, Gemma4Config
 from vllm.model_executor.models.gemma4 import (
+    assert_noncausal_layers,
     noncausal_full_attention,
     noncausal_layer_plan,
 )
+from vllm.v1.attention.backend import AttentionType
 
 # google/gemma-4-E4B-it: 42 layers, every sixth full, the last 18 KV-shared.
 E4B_LAYER_TYPES = [
@@ -145,3 +147,54 @@ def test_kv_shared_noncausal_source_is_itself_noncausal():
     for e in plan:
         if e["noncausal"] and e["kv_source"] is not None:
             assert plan[e["kv_source"]]["noncausal"]
+
+
+def _fake_model(layer_types, attn_types):
+    """A model skeleton: .model.layers[i].self_attn.attn.attn_type."""
+    from types import SimpleNamespace
+
+    layers = [
+        SimpleNamespace(self_attn=SimpleNamespace(attn=SimpleNamespace(attn_type=t)))
+        for t in attn_types
+    ]
+    return SimpleNamespace(model=SimpleNamespace(layers=layers))
+
+
+@pytest.mark.cpu_test
+def test_silent_causal_guard_passes_when_the_built_layers_match():
+    text = _text_config(E4B_LAYER_TYPES, 18, is_causal=False)
+    built = [
+        AttentionType.ENCODER_ONLY if t == "full_attention" else AttentionType.DECODER
+        for t in E4B_LAYER_TYPES
+    ]
+    assert assert_noncausal_layers(_fake_model(E4B_LAYER_TYPES, built), text) == 7
+    stock = _text_config(E4B_LAYER_TYPES, 18)
+    assert assert_noncausal_layers(_fake_model(E4B_LAYER_TYPES, [AttentionType.DECODER] * 42), stock) == 0
+
+
+@pytest.mark.cpu_test
+def test_silent_causal_guard_raises_on_a_causal_build_under_the_declaration():
+    """The dangerous case: declared non-causal, built the stock way (plugin absent,
+    stale file): must raise, never serve one-way quietly."""
+    text = _text_config(E4B_LAYER_TYPES, 18, is_causal=False)
+    with pytest.raises(RuntimeError, match="7 full-attention layers should be bidirectional, 0 are"):
+        assert_noncausal_layers(_fake_model(E4B_LAYER_TYPES, [AttentionType.DECODER] * 42), text)
+    # and a partial switch (one KV-shared full layer left causal)
+    built = [
+        AttentionType.ENCODER_ONLY if t == "full_attention" else AttentionType.DECODER
+        for t in E4B_LAYER_TYPES
+    ]
+    built[41] = AttentionType.DECODER
+    with pytest.raises(RuntimeError, match=r"\(41, 'full_attention', 'causal'\)"):
+        assert_noncausal_layers(_fake_model(E4B_LAYER_TYPES, built), text)
+
+
+@pytest.mark.cpu_test
+def test_silent_causal_guard_raises_on_a_bidirectional_build_without_the_declaration():
+    stock = _text_config(G31_LAYER_TYPES)
+    built = [
+        AttentionType.ENCODER_ONLY if t == "full_attention" else AttentionType.DECODER
+        for t in G31_LAYER_TYPES
+    ]
+    with pytest.raises(RuntimeError, match="0 full-attention layers should be bidirectional, 10 are"):
+        assert_noncausal_layers(_fake_model(G31_LAYER_TYPES, built), stock)

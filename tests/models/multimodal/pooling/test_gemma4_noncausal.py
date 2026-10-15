@@ -216,4 +216,7 @@ def test_noncausal_and_forced_causal_differ(vllm_runner):
     ours_nc = _vllm(vllm_runner, linne_dir, prompts, W, cap, True)
     ours_c = _vllm(vllm_runner, linne_dir, prompts, W, cap, False)
     our_gap = max((ours_nc[k] - ours_c[k]).abs().max().item() for k in nc)
-    assert ref_gap > 1e-3 and our_gap > 1e-3, (ref_gap, our_gap)
+    # the engine-vs-reference numeric gap in causal mode: the mode change must move the readout by clearly more
+    engine_gap = max((c[k][1] - ours_c[k]).abs().max().item() for k in nc)
+    assert ref_gap > 1e-3, ref_gap
+    assert our_gap > max(2 * engine_gap, 1e-2), (our_gap, engine_gap)

@@ -268,6 +268,39 @@ def noncausal_layer_plan(config) -> list[dict[str, object]]:
     return plan
 
 
+def assert_noncausal_layers(model: nn.Module, config) -> int:
+    """The SILENT-CAUSAL GUARD: with the declaration on, every full-attention
+    layer's attention must be an encoder-only (bidirectional) attention and
+    every sliding layer a decoder one; without it, none. A partial or absent
+    switch (a stale copy of this file, a plugin that did not load, a KV-shared
+    layer built the stock way) would otherwise serve the prompt one-way with no
+    error: a two-way checkpoint read causally gives mostly the same picks and
+    silently different probabilities. Raises RuntimeError; returns the number of
+    bidirectional layers."""
+    plan = noncausal_layer_plan(config)
+    layers = getattr(getattr(model, "model", model), "layers", None)
+    if layers is None:
+        raise RuntimeError("assert_noncausal_layers: no .model.layers on this model")
+    want = sum(1 for e in plan if e["noncausal"])
+    got, bad = 0, []
+    for idx, (layer, entry) in enumerate(zip(layers, plan)):
+        attn = getattr(getattr(layer, "self_attn", None), "attn", None)
+        if attn is None:
+            continue
+        is_bidi = getattr(attn, "attn_type", None) == AttentionType.ENCODER_ONLY
+        if is_bidi != bool(entry["noncausal"]):
+            bad.append((idx, entry["layer_type"], "bidirectional" if is_bidi else "causal"))
+        got += int(is_bidi)
+    if bad:
+        raise RuntimeError(
+            "Gemma4 non-causal full attention: the built layers do not match the "
+            f"declaration (is_causal={getattr(config, 'is_causal', True)}): "
+            f"{want} full-attention layers should be bidirectional, {got} are; "
+            f"mismatches (layer, type, built as): {bad[:8]}"
+        )
+    return got
+
+
 class Gemma4MLP(nn.Module):
     def __init__(
         self,
@@ -1682,6 +1715,14 @@ class Gemma4ForCausalLM(
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        # the silent-causal guard: the built attention types must match the declaration
+        self.num_noncausal_layers = assert_noncausal_layers(self, config)
+        if self.num_noncausal_layers:
+            logger.info(
+                "Gemma4 non-causal full attention: %d of %d layers bidirectional",
+                self.num_noncausal_layers,
+                config.num_hidden_layers,
+            )
 
         # --- MixtureOfExperts protocol ---
         self.moe_layers: list[nn.Module] = []
