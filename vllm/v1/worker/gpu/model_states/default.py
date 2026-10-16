@@ -229,6 +229,7 @@ class DefaultModelState(ModelState):
             is_prefilling=torch.from_numpy(input_batch.is_prefilling_np),
             mm_req_doc_ranges=req_doc_ranges,
             for_cudagraph_capture=for_capture,
+            causal=(input_batch.attention_causal if input_batch.attention_causal is not None else True),
             rswa_prefix_lens=input_batch.prompt_lens,
             req_idx=input_batch.idx_mapping_np,
             ubatch_idx=ubatch_idx,
