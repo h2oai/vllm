@@ -1077,6 +1077,24 @@ class Scheduler(SchedulerInterface):
                         # we can stop the scheduling here.
                         break
 
+                    if (
+                        getattr(request, "attention_mode", "causal") == "bidirectional"
+                        and num_new_tokens > request_token_budget
+                    ):
+                        # A bidirectional prompt must be prefilled in one step
+                        # (its full-attention layers read the whole prompt);
+                        # wait for a step with the budget.
+                        if num_new_tokens > self.max_num_scheduled_tokens:
+                            raise ValueError(
+                                f"bidirectional request {request.request_id}: the "
+                                f"prompt ({num_new_tokens} tokens) exceeds "
+                                f"max_num_batched_tokens "
+                                f"({self.max_num_scheduled_tokens})"
+                            )
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
+
                     num_new_tokens = min(num_new_tokens, request_token_budget)
                     assert num_new_tokens > 0
 
