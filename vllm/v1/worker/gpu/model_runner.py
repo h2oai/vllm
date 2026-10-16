@@ -1202,18 +1202,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         for new_req_data in scheduler_output.scheduled_new_reqs:
             assert new_req_data.prefill_token_ids is not None
             req_id = new_req_data.req_id
-            # H2O per-request attention: remember the request's mode (from vllm_xargs attention_mode)
-            mode = _attention_mode_of(new_req_data.sampling_params)
-            if mode != "causal":
-                self.req_attention_mode[req_id] = mode
-                logger.info("H2O per-request attention: request %s is %s", req_id, mode)
-            else:
-                self.req_attention_mode.pop(req_id, None)
 
             # Streaming input update: request already exists from a prior
             # chunk. Remove old state so it can be cleanly re-added below
             # with the updated prompt_token_ids and mm_features.
             self._remove_request(req_id)
+
+            # H2O per-request attention: remember the request's mode (from vllm_xargs attention_mode); after the
+            # removal above, which forgets any earlier entry
+            mode = _attention_mode_of(new_req_data.sampling_params)
+            if mode != "causal":
+                self.req_attention_mode[req_id] = mode
+                logger.info("H2O per-request attention: request %s is %s", req_id, mode)
 
             prompt_len = new_req_data.prompt_len
             sampling_params = new_req_data.sampling_params
