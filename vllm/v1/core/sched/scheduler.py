@@ -674,7 +674,10 @@ class Scheduler(SchedulerInterface):
             )
 
             # Apply Mamba alignment before encoder caps.
-            if self.need_mamba_block_aligned_split:
+            if (
+                self.need_mamba_block_aligned_split
+                and getattr(request, "attention_mode", "causal") != "bidirectional"
+            ):
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
                 )
@@ -1077,11 +1080,43 @@ class Scheduler(SchedulerInterface):
                         # we can stop the scheduling here.
                         break
 
+                    if (
+                        getattr(request, "attention_mode", "causal") == "bidirectional"
+                        and num_new_tokens > request_token_budget
+                    ):
+                        # A bidirectional prompt must be prefilled in one step
+                        # (its full-attention layers read the whole prompt);
+                        # wait for a step with the budget.
+                        if num_new_tokens > self.max_num_scheduled_tokens:
+                            # It can never fit a step: finish it with an error for
+                            # this request only (the engine keeps serving).
+                            logger.warning(
+                                "bidirectional request %s: the prompt (%d tokens) "
+                                "exceeds max_num_batched_tokens (%d); a bidirectional "
+                                "prompt is prefilled in one step, raise "
+                                "--max-num-batched-tokens (e.g. to --max-model-len)",
+                                request.request_id,
+                                num_new_tokens,
+                                self.max_num_scheduled_tokens,
+                            )
+                            request_queue.pop_request()
+                            request.status = RequestStatus.FINISHED_ERROR
+                            self._free_request(request)
+                            continue
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
+
                     num_new_tokens = min(num_new_tokens, request_token_budget)
                     assert num_new_tokens > 0
 
-                    # Apply Mamba alignment before encoder caps.
-                    if self.need_mamba_block_aligned_split:
+                    # Apply Mamba alignment before encoder caps (not to a
+                    # bidirectional request: its prefill is never split and
+                    # its SSM state is never cached).
+                    if (
+                        self.need_mamba_block_aligned_split
+                        and getattr(request, "attention_mode", "causal") != "bidirectional"
+                    ):
                         num_new_tokens = self._mamba_block_aligned_split(
                             request,
                             num_new_tokens,

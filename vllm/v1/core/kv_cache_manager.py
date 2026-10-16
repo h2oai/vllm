@@ -596,7 +596,11 @@ class KVCacheManager:
             total_computed_tokens + num_new_tokens,
             request.num_tokens,
         )
-        self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        # H2O per-request attention: a bidirectional request carries no block
+        # hashes (its KV is not causal and must never be shared through the
+        # prefix cache), so there is nothing to cache for it.
+        if request.block_hashes or getattr(request, "attention_mode", "causal") != "bidirectional":
+            self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
 
@@ -793,7 +797,11 @@ class KVCacheManager:
             num_computed_tokens: The number of computed tokens, including tokens
                 that are already cached and tokens to be cached.
         """
-        if self.enable_caching:
+        if self.enable_caching and (
+            request.block_hashes or getattr(request, "attention_mode", "causal") != "bidirectional"
+        ):
+            # H2O per-request attention: a bidirectional request has no block
+            # hashes and its (non-causal) KV is never committed to the cache
             self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(

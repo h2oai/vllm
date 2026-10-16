@@ -184,6 +184,19 @@ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 logger = init_logger(__name__)
 
 
+
+def _attention_mode_of(sampling_params) -> str:
+    """H2O per-request attention: the request's mode from its extra args
+    ("attention_mode": causal | bidirectional, one-way | two-way), default causal."""
+    extra = getattr(sampling_params, "extra_args", None) if sampling_params is not None else None
+    mode = (extra or {}).get("attention_mode")
+    if mode is None:
+        return "causal"
+    mode = str(mode).strip().lower().replace("-", "_")
+    if mode in ("two_way", "twoway", "bidirectional"):
+        return "bidirectional"
+    return "causal"
+
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -318,6 +331,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
             num_prefill_lookahead=num_prefill_lookahead,
         )
+        # H2O per-request attention: req_id -> "bidirectional" for the requests that asked for it, and a persistent
+        # int32 buffer for the per-sequence causal flags (1 = causal) handed to the attention metadata
+        self.req_attention_mode: dict[str, str] = {}
+        self.attention_causal_gpu = torch.ones(self.max_num_reqs + 1, dtype=torch.int32, device=self.device)
         self.adaptive_verification: AdaptiveVerificationManager | None = None
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
@@ -1071,6 +1088,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return cuda_graph_size
 
     def _remove_request(self, req_id: str) -> bool:
+        self.req_attention_mode.pop(req_id, None)
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
         self.model_state.remove_request(req_id)
@@ -1126,6 +1144,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # chunk. Remove old state so it can be cleanly re-added below
             # with the updated prompt_token_ids and mm_features.
             self._remove_request(req_id)
+
+            # H2O per-request attention: remember the request's mode (from vllm_xargs attention_mode); after the
+            # removal above, which forgets any earlier entry
+            mode = _attention_mode_of(new_req_data.sampling_params)
+            if mode != "causal":
+                self.req_attention_mode[req_id] = mode
+                logger.debug("H2O per-request attention: request %s is %s", req_id, mode)
 
             prompt_len = new_req_data.prompt_len
             sampling_params = new_req_data.sampling_params
@@ -1424,10 +1449,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # prompt_lens is only used in R-SWA case.
             prompt_lens = self.req_states.prompt_len.gpu[idx_mapping]
 
+        # H2O per-request attention: a per-sequence causal flag when any request in the batch is bidirectional
+        attention_causal = None
+        if self.req_attention_mode and any(rid in self.req_attention_mode for rid in req_ids):
+            flags = torch.ones(num_reqs_padded, dtype=torch.int32)
+            for i, rid in enumerate(req_ids):
+                if self.req_attention_mode.get(rid) == "bidirectional":
+                    flags[i] = 0
+            self.attention_causal_gpu[:num_reqs_padded].copy_(flags, non_blocking=True)
+            attention_causal = self.attention_causal_gpu[:num_reqs_padded]
         input_batch = InputBatch(
             req_ids=req_ids,
             num_reqs=num_reqs,
             num_reqs_after_padding=num_reqs_padded,
+            attention_causal=attention_causal,
             idx_mapping=idx_mapping,
             idx_mapping_np=idx_mapping_np,
             expanded_idx_mapping=expanded_idx_mapping,

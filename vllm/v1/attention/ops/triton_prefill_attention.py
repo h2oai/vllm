@@ -214,6 +214,23 @@ def get_block_size(dtype: torch.dtype) -> int:
         return 64
 
 
+# Head sizes above 256 (Gemma-4's 512-wide global layers, served bidirectionally
+# as encoder-only attention through this kernel): with the default block the
+# kernel's shared memory is ~2,304 bytes per block row at head_dim 512, i.e.
+# 294,912 bytes at BLOCK 128 (measured: Triton OutOfResources on an L40S,
+# limit 101,376; an H100 allows 232,448). BLOCK 32 needs ~74 KB and fits every
+# current card; 16 is the fallback for ~48 KB parts.
+WIDE_HEAD_DIM = 256
+WIDE_HEAD_BLOCK = 32
+
+
+def wide_head_block_size(dtype: torch.dtype, head_dim: int) -> int:
+    """The block size for a head_dim above WIDE_HEAD_DIM (else get_block_size)."""
+    if head_dim <= WIDE_HEAD_DIM:
+        return get_block_size(dtype)
+    return min(WIDE_HEAD_BLOCK, get_block_size(dtype))
+
+
 def context_attention_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -235,9 +252,8 @@ def context_attention_fwd(
     b_seq_len: [b]
     out: [b * s, head, head_dim]
     """
-    BLOCK = get_block_size(q.dtype)
-
     Lq, Lk, _ = q.shape[-1], k.shape[-1], v.shape[-1]
+    BLOCK = wide_head_block_size(q.dtype, Lk)
 
     sm_scale = 1.0 / (Lq**0.5) if softmax_scale is None else softmax_scale
     # rescale with 1/ln(2) for triton exp2
