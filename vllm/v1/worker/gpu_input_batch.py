@@ -47,6 +47,8 @@ class CachedRequestState:
     mrope_position_delta: int | None = None
 
     lora_request: LoRARequest | None = None
+    # H2O per-request attention: "causal" or "bidirectional" (see vllm/v1/request.py)
+    attention_mode: str = "causal"
     prompt_embeds: torch.Tensor | None = None
     # To accumulate prompt logprobs tensor chunks across prefill steps.
     in_progress_prompt_logprobs_cpu: LogprobsTensors | None = None

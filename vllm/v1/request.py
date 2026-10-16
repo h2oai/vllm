@@ -222,6 +222,35 @@ class Request:
         # add_request, then observed each verify step); stays None otherwise.
         self.spec_decode_metrics: RequestSpecDecodeMetrics | None = None
 
+        # Per-request attention mode (H2O): "causal" (default) or "bidirectional".
+        # A bidirectional request has its full-attention layers read the whole
+        # prompt in both directions (per-sequence causal flag in the attention
+        # metadata); it is prefill-only (max_tokens == 1: the next-token logits
+        # of the prefill are the readout), is never chunked, and never shares KV
+        # blocks with the prefix cache in either direction (its KV is not causal).
+        self.attention_mode = "causal"
+        if sampling_params is not None and sampling_params.extra_args:
+            mode = sampling_params.extra_args.get("attention_mode")
+            if mode is not None:
+                mode = str(mode).strip().lower().replace("-", "_")
+                if mode in ("one_way", "oneway"):
+                    mode = "causal"
+                elif mode in ("two_way", "twoway"):
+                    mode = "bidirectional"
+                if mode not in ("causal", "bidirectional"):
+                    raise ValueError(
+                        f"attention_mode must be 'causal' or 'bidirectional', got {mode!r}"
+                    )
+                self.attention_mode = mode
+        if self.attention_mode == "bidirectional":
+            if self.max_tokens != 1:
+                raise ValueError(
+                    "attention_mode 'bidirectional' needs max_tokens=1: the readout "
+                    "is the prefill's next-token distribution; no decoding on a "
+                    "bidirectional prefix"
+                )
+            block_hasher = None  # no prefix-cache reads or writes for this request
+
         self.block_hashes: list[BlockHash] = []
         # Store the block hasher without binding self to avoid creating a
         # reference cycle (Request -> partial -> Request) that prevents

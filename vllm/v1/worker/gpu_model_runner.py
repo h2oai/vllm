@@ -464,6 +464,19 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 
 
+
+def _attention_mode_of(sampling_params) -> str:
+    """H2O per-request attention: the request's mode from its extra args
+    ("attention_mode": causal | bidirectional, one-way | two-way), default causal."""
+    extra = getattr(sampling_params, "extra_args", None) if sampling_params is not None else None
+    mode = (extra or {}).get("attention_mode")
+    if mode is None:
+        return "causal"
+    mode = str(mode).strip().lower().replace("-", "_")
+    if mode in ("two_way", "twoway", "bidirectional"):
+        return "bidirectional"
+    return "causal"
+
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
@@ -780,6 +793,14 @@ class GPUModelRunner(
         )
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
+        )
+        # H2O per-request attention: per-sequence causal flags (int32, 1 = causal)
+        self.per_seq_causal_cpu = torch.ones(
+            self.max_num_reqs + 1, dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
+        )
+        self.batch_has_bidirectional = False
+        self.per_seq_causal_gpu = torch.ones(
+            self.max_num_reqs + 1, dtype=torch.int32, device=self.device
         )
         self.seq_lens = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=self.device
@@ -1285,6 +1306,7 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                attention_mode=_attention_mode_of(sampling_params),
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -2394,6 +2416,23 @@ class GPUModelRunner(
                 self.input_batch.replayssm_decode_base_cpu_tensor[:num_reqs_padded]
             )
 
+        # H2O per-request attention: when any scheduled request is bidirectional,
+        # the attention metadata carries a per-sequence causal flag (int32, 1 =
+        # causal) in a persistent buffer; every other step keeps the plain True.
+        causal_flag: bool | torch.Tensor = True
+        self.batch_has_bidirectional = False
+        if any(
+            self.requests[rid].attention_mode == "bidirectional"
+            for rid in self.input_batch.req_ids[:num_reqs]
+        ):
+            flags = self.per_seq_causal_cpu[:num_reqs_padded]
+            flags.fill_(1)
+            for i, rid in enumerate(self.input_batch.req_ids[:num_reqs]):
+                if self.requests[rid].attention_mode == "bidirectional":
+                    flags[i] = 0
+            self.per_seq_causal_gpu[:num_reqs_padded].copy_(flags, non_blocking=True)
+            causal_flag = self.per_seq_causal_gpu[:num_reqs_padded]
+            self.batch_has_bidirectional = True
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
@@ -2406,7 +2445,7 @@ class GPUModelRunner(
             max_seq_len=max_seq_len,
             block_table_tensor=block_table_gid_0,
             slot_mapping=slot_mapping_gid_0,
-            causal=True,
+            causal=causal_flag,
             is_prefilling=is_prefilling,
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
