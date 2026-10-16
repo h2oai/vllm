@@ -797,7 +797,11 @@ class KVCacheManager:
             num_computed_tokens: The number of computed tokens, including tokens
                 that are already cached and tokens to be cached.
         """
-        if self.enable_caching:
+        if self.enable_caching and (
+            request.block_hashes or getattr(request, "attention_mode", "causal") != "bidirectional"
+        ):
+            # H2O per-request attention: a bidirectional request has no block
+            # hashes and its (non-causal) KV is never committed to the cache
             self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(
