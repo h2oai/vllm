@@ -1174,12 +1174,21 @@ class Scheduler(SchedulerInterface):
                         # (its full-attention layers read the whole prompt);
                         # wait for a step with the budget.
                         if num_new_tokens > self.max_num_scheduled_tokens:
-                            raise ValueError(
-                                f"bidirectional request {request.request_id}: the "
-                                f"prompt ({num_new_tokens} tokens) exceeds "
-                                f"max_num_batched_tokens "
-                                f"({self.max_num_scheduled_tokens})"
+                            # It can never fit a step: finish it with an error for
+                            # this request only (the engine keeps serving).
+                            logger.warning(
+                                "bidirectional request %s: the prompt (%d tokens) "
+                                "exceeds max_num_batched_tokens (%d); a bidirectional "
+                                "prompt is prefilled in one step, raise "
+                                "--max-num-batched-tokens (e.g. to --max-model-len)",
+                                request.request_id,
+                                num_new_tokens,
+                                self.max_num_scheduled_tokens,
                             )
+                            request_queue.pop_request()
+                            request.status = RequestStatus.FINISHED_ERROR
+                            self._free_request(request)
+                            continue
                         request_queue.pop_request()
                         step_skipped_waiting.prepend_request(request)
                         continue
