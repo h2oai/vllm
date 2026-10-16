@@ -327,6 +327,7 @@ class MambaHybridModelState(DefaultModelState):
             positions=input_batch.positions,
             model_specific_attn_metadata=mamba_attn_metadata,
             for_cudagraph_capture=for_capture,
+            causal=(input_batch.attention_causal if input_batch.attention_causal is not None else True),
             rswa_prefix_lens=input_batch.prompt_lens,
         )
         if self.recoverssm is not None:

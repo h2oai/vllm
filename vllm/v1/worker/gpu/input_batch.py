@@ -117,6 +117,9 @@ class InputBatch:
 
     # [num_reqs] set only under PCP+DCP (see CommonAttentionMetadata).
     dcp_local_seq_lens_cpu_upper_bound: torch.Tensor | None = None
+    # H2O per-request attention: int32 [num_reqs_after_padding], 1 = causal, 0 = the request's full-attention layers
+    # read its prompt bidirectionally; None when every request in the batch is causal (the plain causal=True path)
+    attention_causal: torch.Tensor | None = None
 
     @classmethod
     def make_dummy(

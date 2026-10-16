@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
@@ -27,6 +28,8 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -237,6 +240,7 @@ class Request:
                     )
                 self.attention_mode = mode
         if self.attention_mode == "bidirectional":
+            logger.info("H2O per-request attention: request %s bidirectional (prefill-only, no prefix cache)", request_id)
             if self.max_tokens != 1:
                 raise ValueError(
                     "attention_mode 'bidirectional' needs max_tokens=1: the readout "
