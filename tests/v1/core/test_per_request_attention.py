@@ -7,14 +7,15 @@ CPU only."""
 import pytest
 
 from vllm.sampling_params import SamplingParams
-from vllm.v1.core.kv_cache_utils import get_request_block_hasher
-from vllm.v1.request import Request, RequestStatus
 from vllm.utils.hashing import sha256
+from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.request import Request, RequestStatus
 
 from .utils import EOS_TOKEN_ID, create_scheduler
 
 
 def _request(req_id: str, num_tokens: int, mode: str | None, max_tokens: int = 1, block_size: int = 16):
+    init_none_hash(sha256)
     extra = {"attention_mode": mode} if mode is not None else None
     sp = SamplingParams(max_tokens=max_tokens, extra_args=extra)
     sp.update_from_generation_config({}, EOS_TOKEN_ID)
@@ -23,7 +24,6 @@ def _request(req_id: str, num_tokens: int, mode: str | None, max_tokens: int = 1
         prompt_token_ids=list(range(num_tokens)),
         sampling_params=sp,
         pooling_params=None,
-        eos_token_id=EOS_TOKEN_ID,
         block_hasher=get_request_block_hasher(block_size, sha256),
     )
 
