@@ -440,7 +440,7 @@ def build_attn_metadata(
             causal if isinstance(causal, (bool, torch.Tensor)) else causal.get(i, True)
         )
         if isinstance(group_causal, torch.Tensor):
-            logger.info("H2O per-request attention: group %d gets a per-sequence causal tensor %s", i, group_causal.tolist())
+            logger.debug("H2O per-request attention: group %d gets a per-sequence causal tensor %s", i, group_causal.tolist())
 
         common_attn_metadata_extra_kwargs = (
             model_specific_attn_metadata.get_extra_common_attn_kwargs(i, num_reqs)

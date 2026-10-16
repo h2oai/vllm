@@ -240,7 +240,7 @@ class Request:
                     )
                 self.attention_mode = mode
         if self.attention_mode == "bidirectional":
-            logger.info("H2O per-request attention: request %s bidirectional (prefill-only, no prefix cache)", request_id)
+            logger.debug("H2O per-request attention: request %s bidirectional (prefill-only, no prefix cache)", request_id)
             if self.max_tokens != 1:
                 raise ValueError(
                     "attention_mode 'bidirectional' needs max_tokens=1: the readout "

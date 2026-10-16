@@ -1352,7 +1352,7 @@ class GPUModelRunner(
                 attention_mode=_attention_mode_of(sampling_params),
             )
             if req_state.attention_mode != "causal":
-                logger.info("H2O per-request attention: request %s is %s", req_id, req_state.attention_mode)
+                logger.debug("H2O per-request attention: request %s is %s", req_id, req_state.attention_mode)
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
 

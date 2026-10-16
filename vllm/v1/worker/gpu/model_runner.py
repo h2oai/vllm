@@ -1150,7 +1150,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             mode = _attention_mode_of(new_req_data.sampling_params)
             if mode != "causal":
                 self.req_attention_mode[req_id] = mode
-                logger.info("H2O per-request attention: request %s is %s", req_id, mode)
+                logger.debug("H2O per-request attention: request %s is %s", req_id, mode)
 
             prompt_len = new_req_data.prompt_len
             sampling_params = new_req_data.sampling_params

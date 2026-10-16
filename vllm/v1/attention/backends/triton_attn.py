@@ -226,7 +226,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             prefix_scheduler_metadata = None
 
         if isinstance(common_attn_metadata.causal, torch.Tensor):
-            logger.info("H2O per-request attention: Triton builder sees per-seq causal %s", common_attn_metadata.causal.tolist())
+            logger.debug("H2O per-request attention: Triton builder sees per-seq causal %s", common_attn_metadata.causal.tolist())
         attn_metadata = TritonAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
@@ -657,7 +657,7 @@ class TritonAttentionImpl(AttentionImpl):
 
         if isinstance(attn_metadata.causal, torch.Tensor) and not getattr(self, "_h2o_logged", False):
             self._h2o_logged = True
-            logger.info("H2O per-request attention: Triton forward runs with per-seq causal %s", attn_metadata.causal.tolist())
+            logger.debug("H2O per-request attention: Triton forward runs with per-seq causal %s", attn_metadata.causal.tolist())
         unified_attention(
             q=query[:num_actual_tokens],
             k=key_cache,
