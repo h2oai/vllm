@@ -9,7 +9,7 @@ import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher
 from vllm.v1.request import Request, RequestStatus
-from vllm.v1.utils import sha256
+from vllm.utils.hashing import sha256
 
 from .utils import EOS_TOKEN_ID, create_scheduler
 
