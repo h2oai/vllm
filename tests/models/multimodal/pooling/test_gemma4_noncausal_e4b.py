@@ -35,11 +35,10 @@ PROMPTS = [
     "D: other\nAnswer with the letter of one option only.",
 ]
 MAX_ARGMAX_DISAGREEMENT = 0.01
-# Tolerances from the measured drift (bidir-test2, 2026-10-15, 20 DI dev prompts, E4B): transformers bf16 itself sits
-# max 0.136 / mean 0.005 from transformers fp32; vLLM (Triton encoder path, BLOCK 32 on the 512-wide heads, bf16,
-# cudagraphs) sits max 0.089 / mean 0.004 from fp32, i.e. closer than the bf16 reference; argmax agreed on all 19
-# rows with a top-2 margin >= 0.05. So the reference is fp32 (the anchor), the max-|dp| bound is 0.10 (near ties
-# amplify ~0.3-logit bf16 noise), the mean bound 0.01, and argmax is judged on clear rows only.
+# Tolerances, from a measured run of these prompts on E4B: transformers bf16 itself drifts further from transformers
+# fp32 than vLLM does (Triton encoder path, BLOCK 32 on the 512-wide heads, bf16, cudagraphs), and argmax agreed on
+# every row with a clear top-2 margin. So the reference is fp32 (the anchor), the max-|dp| bound leaves room for near
+# ties to amplify bf16 noise, the mean bound is tight, and argmax is judged on clear rows only.
 MAX_ABS_DP = 0.10
 MAX_MEAN_DP = 0.01
 CLEAR_MARGIN = 0.05
