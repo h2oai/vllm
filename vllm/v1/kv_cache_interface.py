@@ -1405,6 +1405,34 @@ def get_kv_cache_spec_sliding_window(kv_cache_spec: KVCacheSpec) -> int | None:
     return None
 
 
+def is_windowed_attention_spec(kv_cache_spec: KVCacheSpec) -> bool:
+    """Whether the spec's layers attend through a window of their own: sliding-
+    window or chunked-local attention, including such a layer promoted to a
+    FullAttentionSpec for the KV cache (hybrid KV cache manager off), which
+    keeps ``sliding_window`` / ``attention_chunk_size`` set.
+
+    H2O per-request attention (``vllm_xargs attention_mode=bidirectional``)
+    reads a request's FULL-attention layers in both directions and leaves
+    these windowed layers causal: that is the two-way reading the checkpoints
+    are trained with (Gemma-4's sliding layers keep their causal window, as
+    ``Gemma4Attention`` builds them for a non-causal checkpoint). Resolve a
+    ``UniformTypeKVCacheSpecs`` to the layer's own spec first.
+    """
+    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+        raise ValueError(
+            "is_windowed_attention_spec: resolve the layer's own spec first "
+            "(UniformTypeKVCacheSpecs.kv_cache_specs[layer_name])"
+        )
+    if isinstance(kv_cache_spec, (SlidingWindowSpec, ChunkedLocalAttentionSpec)):
+        return True
+    if isinstance(kv_cache_spec, FullAttentionSpec):
+        return (
+            kv_cache_spec.sliding_window is not None
+            or kv_cache_spec.attention_chunk_size is not None
+        )
+    return False
+
+
 @dataclass
 class KVCacheTensor:
     """A class for specifying how the workers should initialize the KV cache.

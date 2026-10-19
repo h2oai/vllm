@@ -152,6 +152,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpecKind,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
+    is_windowed_attention_spec,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.outputs import (
@@ -2497,6 +2498,16 @@ class GPUModelRunner(
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
                 kv_cache_spec = kv_cache_spec.kv_cache_specs[attn_group.layer_names[0]]
             cache_key = (kv_cache_spec, type(builder))
+            if isinstance(
+                common_attn_metadata.causal, torch.Tensor
+            ) and is_windowed_attention_spec(kv_cache_spec):
+                # H2O per-request attention: the per-sequence causal flag
+                # reaches the full-attention layers only; a sliding-window
+                # (or chunked-local) layer stays causal for every request,
+                # the way the two-way reading is trained (Gemma-4's sliding
+                # layers keep their causal window). The same tensor on every
+                # group gave a bidirectional request a two-sided window there.
+                common_attn_metadata = common_attn_metadata.replace(causal=True)
 
             extra_attn_metadata_args = {}
             if use_spec_decode and isinstance(
