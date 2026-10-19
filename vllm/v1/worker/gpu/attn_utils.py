@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     UniformTypeKVCacheSpecs,
+    is_windowed_attention_spec,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.ubatch_utils import get_num_ubatches
@@ -482,9 +483,20 @@ def build_attn_metadata(
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(ubatch_idx)
+            group_common_attn_metadata = common_attn_metadata
+            if isinstance(group_causal, torch.Tensor) and is_windowed_attention_spec(
+                attn_group.kv_cache_spec
+            ):
+                # H2O per-request attention: the per-sequence causal flag
+                # reaches the full-attention layers only; a sliding-window (or
+                # chunked-local) layer stays causal for every request, the way
+                # the two-way reading is trained (Gemma-4's sliding layers keep
+                # their causal window). attn_group.kv_cache_spec is the layer's
+                # own spec, also inside a UniformTypeKVCacheSpecs group.
+                group_common_attn_metadata = common_attn_metadata.replace(causal=True)
             if for_cudagraph_capture:
                 metadata = attn_metadata_builder.build_for_cudagraph_capture(
-                    common_attn_metadata
+                    group_common_attn_metadata
                 )
             else:
                 attn_metadata_extra_kwargs = (
@@ -497,7 +509,7 @@ def build_attn_metadata(
                 )
                 metadata = attn_metadata_builder.build(
                     common_prefix_len=0,
-                    common_attn_metadata=common_attn_metadata,
+                    common_attn_metadata=group_common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )
             for layer_name in attn_group.layer_names:
