@@ -80,6 +80,11 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
+# H2O per-request attention: a bidirectional prompt that fits one step but not this
+# step's remaining budget is deferred; after this many deferrals the waiting queues
+# admit nothing behind it until it is scheduled (bounded aging, _defer_bidirectional).
+BIDIRECTIONAL_MAX_DEFERRALS = 8
+
 
 class Scheduler(SchedulerInterface):
     def __init__(
@@ -1170,7 +1175,8 @@ class Scheduler(SchedulerInterface):
                             continue
                         if num_new_tokens > request_token_budget:
                             request_queue.pop_request()
-                            step_skipped_waiting.prepend_request(request)
+                            if self._defer_bidirectional(request, step_skipped_waiting):
+                                break
                             continue
 
                     # Pad new decode requests to uniform spec decoding size to
@@ -1217,10 +1223,7 @@ class Scheduler(SchedulerInterface):
                     # Apply Mamba alignment before encoder caps (not to a
                     # bidirectional request: its prefill is never split and
                     # its SSM state is never cached).
-                    if (
-                        self.need_mamba_block_aligned_split
-                        and getattr(request, "attention_mode", "causal") != "bidirectional"
-                    ):
+                    if self.need_mamba_block_aligned_split and not bidirectional:
                         num_new_tokens = self._mamba_block_aligned_split(
                             request,
                             num_new_tokens,
@@ -1296,7 +1299,8 @@ class Scheduler(SchedulerInterface):
                             )
                             self.bidirectional_error_reqs.add(request.request_id)
                             continue
-                        step_skipped_waiting.prepend_request(request)
+                        if self._defer_bidirectional(request, step_skipped_waiting):
+                            break
                         continue
 
                     if num_new_tokens == 0:
@@ -2555,6 +2559,22 @@ class Scheduler(SchedulerInterface):
             self.kv_holding_waiting.add_request(request)
         else:
             self.waiting.add_request(request)
+
+    def _defer_bidirectional(
+        self, request: Request, step_skipped_waiting: RequestQueue
+    ) -> bool:
+        """Put a bidirectional request that does not fit this step back for a
+        later one. Returns True when nothing further should be admitted from
+        the waiting queues this step: after BIDIRECTIONAL_MAX_DEFERRALS the
+        request has aged out. Running requests are scheduled first and the
+        smaller prompts behind a deferred one would otherwise be admitted every
+        step and keep a share of every later step's budget while they decode,
+        so a prompt close to the step cap could wait for as long as traffic
+        continues; with admission held the running set drains and a later step
+        has the room."""
+        step_skipped_waiting.prepend_request(request)
+        request.bidirectional_deferrals += 1
+        return request.bidirectional_deferrals > BIDIRECTIONAL_MAX_DEFERRALS
 
     def _handle_stopped_request(self, request: Request) -> bool:
         """Return True if finished (can be False for resumable requests)."""
