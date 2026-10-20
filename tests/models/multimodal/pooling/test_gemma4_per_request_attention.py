@@ -97,6 +97,13 @@ PROMPTS = [
 # measured for these readouts was 0.05 at most; the same bound is used here.
 MAX_ABS_DP = 0.05
 MAX_MEAN_DP = 0.01
+# Under FP8 (GEMMA4_QUANT=fp8) two engines of the same weights drift on near-tie
+# prompts (measured: up to 0.25 between two FP8 starts of one engine on the same
+# probe), so the bounds are wider there and the argmax is judged on clear rows only
+# (reference top-2 margin at or above CLEAR_MARGIN).
+FP8_MAX_ABS_DP = 0.30
+FP8_MAX_MEAN_DP = 0.06
+CLEAR_MARGIN = 0.20
 
 
 def _label_rows(model, label_ids):
@@ -224,13 +231,40 @@ def test_flagged_read_is_the_two_way_pooling_read_and_unflagged_the_causal_one(
     cleanup_dist_env_and_memory()
     ref_one_way = _pooling_label_probs(vllm_runner, PROMPTS, W, cap, noncausal=False)
 
+    torch.set_printoptions(precision=4, sci_mode=False, linewidth=120)
+    print("one-way (one engine, unflagged):", one_way, sep="\n")
+    print("one-way reference (pooling runner, causal):", ref_one_way, sep="\n")
+    print("two-way (one engine, flagged):", two_way, sep="\n")
+    print("two-way reference (pooling runner, non-causal):", ref_two_way, sep="\n")
+    max_dp, mean_dp = (
+        (FP8_MAX_ABS_DP, FP8_MAX_MEAN_DP) if QUANT else (MAX_ABS_DP, MAX_MEAN_DP)
+    )
     d_two = (two_way - ref_two_way).abs()
     d_one = (one_way - ref_one_way).abs()
-    assert d_one.max().item() <= MAX_ABS_DP and d_one.mean().item() <= MAX_MEAN_DP, (
+    print(
+        "gaps: one-way max/mean",
+        d_one.max().item(),
+        d_one.mean().item(),
+        "two-way max/mean",
+        d_two.max().item(),
+        d_two.mean().item(),
+    )
+    for ours, ref in ((one_way, ref_one_way), (two_way, ref_two_way)):
+        clear = [
+            r
+            for r in range(len(PROMPTS))
+            if float(ref[r].topk(2).values.diff().abs()) >= CLEAR_MARGIN
+        ]
+        assert all(int(ours[r].argmax()) == int(ref[r].argmax()) for r in clear), (
+            clear,
+            ours,
+            ref,
+        )
+    assert d_one.max().item() <= max_dp and d_one.mean().item() <= mean_dp, (
         one_way,
         ref_one_way,
     )
-    assert d_two.max().item() <= MAX_ABS_DP and d_two.mean().item() <= MAX_MEAN_DP, (
+    assert d_two.max().item() <= max_dp and d_two.mean().item() <= mean_dp, (
         two_way,
         ref_two_way,
     )
