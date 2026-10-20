@@ -798,8 +798,10 @@ def windowed_attention_layer_names(vllm_config: VllmConfig) -> set[str]:
     LAYER's own KV cache spec (its sliding window / chunk size), not from the
     KV cache group it lands in: with the hybrid KV cache manager off and equal
     page sizes, one merged FullAttentionSpec (sliding_window set) covers both
-    kinds of layers. A KV-shared or encoder-only layer (no spec of its own)
-    counts as windowed when its module carries a sliding window.
+    kinds of layers. A KV-shared layer returns a spec like any other (the runner
+    merely skips it when building the groups); a layer that returns no spec
+    (encoder-only and encoder attention) counts as windowed when its module
+    carries a sliding window.
     """
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
     from vllm.v1.kv_cache_interface import is_windowed_attention_spec

@@ -80,11 +80,9 @@ def test_scheduled_whole_or_deferred_and_too_long_is_an_error():
     assert out.num_scheduled_tokens.get("short") == 40
     assert "long_ok" not in out.num_scheduled_tokens
     # the third can never fit a step: it is finished with an error for that request
-    # only, through
-    # update_from_output, which EMITS the finished output (finish_reason error) so the
-    # client gets an answer instead
-    # of waiting forever (freeing it inside schedule() left no output at all); the
-    # scheduler stays alive
+    # only, through update_from_output, which EMITS the finished output (finish_reason
+    # error) so the client gets an answer instead of waiting forever (freeing it
+    # inside schedule() left no output at all); the scheduler stays alive
     assert "too_long" not in out.num_scheduled_tokens
     assert "too_long" in scheduler.bidirectional_error_reqs
     model_output = ModelRunnerOutput(
@@ -182,7 +180,15 @@ def test_an_encoder_split_defers_and_a_never_fitting_encoder_input_errors():
     never = _mm_request("never", 100, 4, 80, "bidirectional")  # 80 > any step's 64
     for request in (first, second, never):
         scheduler.add_request(request)
+    # a deferral frees nothing: no encoder input of the deferred request was
+    # allocated (an encoder-decoder cache manager would credit slots that were never
+    # taken)
+    freed = []
+    real_free = scheduler.encoder_cache_manager.free
+    scheduler.encoder_cache_manager.free = lambda req: freed.append(req.request_id)
     out = scheduler.schedule()
+    scheduler.encoder_cache_manager.free = real_free
+    assert freed == []
     assert out.num_scheduled_tokens.get("first") == 48
     assert "second" not in out.num_scheduled_tokens
     assert "never" in scheduler.bidirectional_error_reqs
@@ -251,3 +257,37 @@ def test_a_deferred_bidirectional_prompt_ages_and_holds_admission(monkeypatch):
     # 8 deferrals, then at most 8 steps for the running requests to finish
     assert step is not None and step <= 8 + 8 + 1, step
     assert scheduler.requests["two_way"].bidirectional_deferrals >= 8
+
+
+def _config(backend_name, kv_connector):
+    backend = SimpleNamespace(name=backend_name) if backend_name else None
+    return SimpleNamespace(
+        attention_config=SimpleNamespace(backend=backend),
+        kv_transfer_config=SimpleNamespace() if kv_connector else None,
+    )
+
+
+def test_a_bidirectional_request_is_refused_where_it_cannot_be_served():
+    """The frontend refuses, with the reason, a bidirectional request on an engine
+    that would read it causally without saying so (any backend but TRITON_ATTN,
+    including an unset one) or could store or load its non-causal KV through a KV
+    connector; decoding (max_tokens != 1) is refused too. A causal request is never
+    checked."""
+    from vllm.v1.request import check_bidirectional_request, parse_attention_mode
+
+    two_way = SamplingParams(max_tokens=1, extra_args={"attention_mode": "two-way"})
+    assert parse_attention_mode(two_way) == "bidirectional"
+    assert parse_attention_mode(SamplingParams(max_tokens=1)) == "causal"
+    assert parse_attention_mode(None) == "causal"
+    with pytest.raises(ValueError, match="attention_mode"):
+        parse_attention_mode(SamplingParams(extra_args={"attention_mode": "x"}))
+    check_bidirectional_request(two_way, _config("TRITON_ATTN", False))  # served
+    with pytest.raises(ValueError, match="TRITON_ATTN"):
+        check_bidirectional_request(two_way, _config("FLASH_ATTN", False))
+    with pytest.raises(ValueError, match="got auto"):
+        check_bidirectional_request(two_way, _config(None, False))
+    with pytest.raises(ValueError, match="KV connector"):
+        check_bidirectional_request(two_way, _config("TRITON_ATTN", True))
+    decoding = SamplingParams(max_tokens=4, extra_args={"attention_mode": "two-way"})
+    with pytest.raises(ValueError, match="max_tokens=1"):
+        check_bidirectional_request(decoding, _config("TRITON_ATTN", False))
