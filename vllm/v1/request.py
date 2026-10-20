@@ -76,6 +76,18 @@ def check_bidirectional_request(sampling_params: SamplingParams, vllm_config) ->
             f"{getattr(backend, 'name', None) if backend is not None else 'auto'}): "
             "it is the only backend that applies a per-sequence causal flag"
         )
+    per_kind = getattr(vllm_config.attention_config, "backend_per_kind", None) or {}
+    elsewhere = {
+        kind: getattr(b, "name", str(b))
+        for kind, b in per_kind.items()
+        if getattr(b, "name", None) != "TRITON_ATTN"
+    }
+    if elsewhere:
+        raise ValueError(
+            "attention_mode 'bidirectional' needs TRITON_ATTN for every attention "
+            f"kind; backend_per_kind routes {elsewhere} to another backend, which "
+            "would ignore the per-sequence causal flag"
+        )
     if vllm_config.kv_transfer_config is not None:
         raise ValueError(
             "attention_mode 'bidirectional' cannot be served with a KV connector: "
