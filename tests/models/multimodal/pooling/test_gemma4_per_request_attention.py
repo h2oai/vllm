@@ -34,7 +34,8 @@ MODEL = os.environ.get("GEMMA4_MODEL", "google/gemma-4-E4B-it")
 QUANT = os.environ.get("GEMMA4_QUANT") or None
 # the generate engine's attention backend: TRITON_ATTN (default) applies the
 # per-sequence flag in its unified kernel; FLASH_ATTN applies it through
-# FlashAttention 4 (GEMMA4_FA_VERSION=4; Hopper needs it set, Blackwell picks it)
+# FlashAttention 4 (GEMMA4_FA_VERSION=4; the version is resolved per model and
+# GPU, so set it explicitly)
 BACKEND = os.environ.get("GEMMA4_BACKEND", "TRITON_ATTN")
 FA_VERSION = int(os.environ.get("GEMMA4_FA_VERSION", "0")) or None
 ENGINE_EXTRA = (
@@ -243,6 +244,7 @@ def _one_engine_label_probs(vllm_runner, prompts, label_ids):
         MODEL,
         attention_backend=BACKEND,
         disable_log_stats=False,  # LLM.get_metrics() for the step count below
+        enable_prefix_caching=False,
         # a hybrid checkpoint (Mamba / gated-delta layers) with prefix caching
         # needs chunked prefill on; a bidirectional prompt is still prefilled
         # whole (whole-or-defer in the scheduler)
@@ -253,6 +255,10 @@ def _one_engine_label_probs(vllm_runner, prompts, label_ids):
         quantization=QUANT,
         limit_mm_per_prompt=MM_LIMIT,
     ) as vllm_model:
+        # an unflagged pass first: on FLASH_ATTN with FlashAttention 4 it leaves
+        # compiled causal kernels in the JIT cache that a later per-sequence call
+        # must not reuse (the vendored compile key does not record the flag)
+        vllm_model.llm.generate(prompts, plain, use_tqdm=False)
         mixed = [p for pair in zip(prompts, prompts) for p in pair]
         params = [flagged, plain] * len(prompts)
         before = _iteration_histogram(vllm_model.llm)
@@ -262,11 +268,12 @@ def _one_engine_label_probs(vllm_runner, prompts, label_ids):
         # tokens against a 4,096-token step) is prefilled in ONE engine step:
         # the two subsets share the step, nothing is serialised. Async
         # scheduling may add one near-empty iteration (the decode step it
-        # schedules before the finish is seen), so the check is on the
-        # iteration that carried the prompts, not on the raw count.
+        # schedules before the finish is seen, one token per request), so the
+        # check counts the iterations that carried more than two tokens per
+        # request (the histogram's 16-token bucket for 12 prompts).
         total = sum(len(o.prompt_token_ids) for o in outputs)
         iterations = after[0] - before[0]
-        big = _iterations_above(before, after, total / 2)
+        big = _iterations_above(before, after, 2 * len(mixed))
         print(
             "mixed batch:",
             total,
@@ -274,7 +281,7 @@ def _one_engine_label_probs(vllm_runner, prompts, label_ids):
             iterations,
             "iterations;",
             big,
-            "iteration(s) above half the tokens",
+            "iteration(s) above two tokens per request",
         )
         assert iterations <= 2 and big == 1 and after[1] - before[1] >= total, (
             total,

@@ -89,14 +89,15 @@ logger = init_logger(__name__)
 _FA4_DYNAMIC_CAUSAL_CACHE = None
 
 
-def _fa4_dynamic_causal_cache():
+def _fa4_dynamic_causal_cache() -> Any:
     """A separate FA4 forward JIT cache for calls that carry a per-sequence
     causal tensor. The vendored kernel's compile key does not record whether
     dynamic_causal is set, so a kernel compiled for a plain causal call (the
     warm-up, any unflagged batch) would be reused for a dynamic-causal call
     and fail on the argument type ("Mismatched type on argument #10 ...
     mDynamicCausal: None"). Keeping the two kinds of calls in two caches keeps
-    every compiled kernel matched to its argument kinds."""
+    every compiled kernel matched to its argument kinds. The proper fix is to
+    record the flag in the vendored compile key; this swap goes once it does."""
     global _FA4_DYNAMIC_CAUSAL_CACHE
     if _FA4_DYNAMIC_CAUSAL_CACHE is None:
         from vllm.vllm_flash_attn.cute.cache_utils import get_jit_cache
@@ -106,7 +107,7 @@ def _fa4_dynamic_causal_cache():
 
 
 @contextlib.contextmanager
-def _fa4_cache_for(dynamic_causal):
+def _fa4_cache_for(dynamic_causal: torch.Tensor | None) -> Any:
     """Run an FA4 forward with the dynamic-causal JIT cache when a per-sequence
     causal tensor is passed, the regular one otherwise."""
     if dynamic_causal is None:
@@ -121,6 +122,7 @@ def _fa4_cache_for(dynamic_causal):
         yield
     finally:
         fwd.compile_cache = saved
+
 
 FA4_DENSE_FLOAT_DTYPES = (torch.bfloat16, torch.float16)
 FA4_DENSE_Q_TILE = 128
@@ -854,7 +856,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         if envs.VLLM_BATCH_INVARIANT:
             max_num_splits = 1
 
-        use_cascade = common_prefix_len > 0
+        # no cascade over a shared prefix beside a per-sequence causal flag (H2O)
+        use_cascade = common_prefix_len > 0 and not isinstance(causal, torch.Tensor)
         max_dcp_context_kv_len = 0
         dcp_context_kv_lens = None
         num_decode_reqs = 0
@@ -1139,6 +1142,14 @@ class FlashAttentionImpl(AttentionImpl):
             requires_softcap=bool(self.logits_soft_cap),
             supports_fa4_hd256=True,
         )
+        if self.vllm_flash_attn_version == 4:
+            # the per-sequence path swaps the vendored forward's JIT cache: look
+            # it up now so a moved API fails at start-up, not on the first
+            # flagged request
+            from vllm.vllm_flash_attn.cute import interface as fa4_interface
+
+            assert hasattr(fa4_interface._flash_attn_fwd, "compile_cache")
+            _fa4_dynamic_causal_cache()
         self.fa4_hd256 = self.vllm_flash_attn_version == 4 and uses_fa4_hd256_kernel(
             head_size
         )
@@ -1337,6 +1348,18 @@ class FlashAttentionImpl(AttentionImpl):
                 )
 
                 mm_prefix_query_ranges = attn_metadata.mm_prefix_query_range_tensor
+                if is_dynamic_causal and (
+                    mm_prefix_query_ranges is not None
+                    or attn_metadata.rswa_prefix_lens is not None
+                ):
+                    # the FA4 call with a per-sequence flag carries no mask_mod,
+                    # so the mm_prefix or R-SWA mask of every sequence in the
+                    # batch would be dropped: refuse rather than read wrongly
+                    # (the frontend refuses such models before a request gets here)
+                    raise NotImplementedError(
+                        "A per-sequence causal flag cannot be combined with the "
+                        "mm_prefix or R-SWA masks on FLASH_ATTN"
+                    )
                 mm_mask_mod = None
                 mm_aux = None
                 if (
@@ -1415,33 +1438,37 @@ class FlashAttentionImpl(AttentionImpl):
                     block_table = block_table[:, :num_pages]
                     num_splits = 1
 
-                with _fa4_cache_for(dynamic_causal):
-                    _FA4_DENSE_ATTENTION_KERNEL(
-                        q=query[:num_actual_tokens],
-                        k=key_cache,
-                        v=value_cache,
-                        out=output[:num_actual_tokens],
-                        cu_seqlens_q=cu_seqlens_q,
-                        max_seqlen_q=max_seqlen_q,
-                        seqused_k=seqused_k,
-                        max_seqlen_k=max_seqlen_k,
-                        softmax_scale=self.scale,
-                        causal=causal,
-                        alibi_slopes=self.alibi_slopes,
-                        window_size=sliding_window_size,
-                        block_table=block_table,
-                        softcap=self.logits_soft_cap,
-                        scheduler_metadata=scheduler_metadata,
-                        fa_version=self.vllm_flash_attn_version,
-                        q_descale=q_descale,
-                        k_descale=k_descale,
-                        v_descale=v_descale,
-                        dynamic_causal=dynamic_causal,
-                        num_splits=num_splits,
-                        s_aux=self.sinks,
-                        mask_mod=rswa_mask_mod_fn or mm_mask_mod,
-                        aux_tensors=rswa_aux or mm_aux,
-                    )
+                fa4_kwargs = dict(
+                    q=query[:num_actual_tokens],
+                    k=key_cache,
+                    v=value_cache,
+                    out=output[:num_actual_tokens],
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    seqused_k=seqused_k,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=self.scale,
+                    causal=causal,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=sliding_window_size,
+                    block_table=block_table,
+                    softcap=self.logits_soft_cap,
+                    scheduler_metadata=scheduler_metadata,
+                    fa_version=self.vllm_flash_attn_version,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    dynamic_causal=dynamic_causal,
+                    num_splits=num_splits,
+                    s_aux=self.sinks,
+                    mask_mod=rswa_mask_mod_fn or mm_mask_mod,
+                    aux_tensors=rswa_aux or mm_aux,
+                )
+                if dynamic_causal is None:
+                    _FA4_DENSE_ATTENTION_KERNEL(**fa4_kwargs)
+                else:
+                    with _fa4_cache_for(dynamic_causal):
+                        _FA4_DENSE_ATTENTION_KERNEL(**fa4_kwargs)
                 return output
 
         # Cascade attention (rare case).
@@ -1522,6 +1549,10 @@ class FlashAttentionImpl(AttentionImpl):
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if isinstance(attn_metadata.causal, torch.Tensor):
+            raise NotImplementedError(
+                "A per-sequence causal flag has no decode-context-parallel path"
+            )
         assert self.vllm_flash_attn_version is not None, (
             "FlashAttention version not detected."
         )

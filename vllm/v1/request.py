@@ -59,44 +59,97 @@ def parse_attention_mode(sampling_params: SamplingParams | None) -> str:
     return mode
 
 
-def check_bidirectional_request(sampling_params: SamplingParams, vllm_config) -> None:
+def _fa4_platform_reason(vllm_config: Any) -> str | None:
+    """Why FlashAttention 4 cannot run on this engine, from the platform and from
+    the version the backend resolves for this model's head size; None when it
+    can. Tests replace this function."""
+    import vllm.envs as envs
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return "FlashAttention 4 runs on CUDA only"
+    if envs.VLLM_BATCH_INVARIANT:
+        return "VLLM_BATCH_INVARIANT selects FlashAttention 2"
+    from vllm.config import set_current_vllm_config
+    from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
+
+    model_config = vllm_config.model_config
+    text_config = getattr(model_config, "hf_text_config", None)
+    head_size = model_config.get_head_size()
+    with set_current_vllm_config(vllm_config):
+        version = get_flash_attn_version(
+            head_size=head_size,
+            requires_softcap=bool(getattr(text_config, "attn_logit_softcapping", None)),
+            supports_fa4_hd256=True,
+        )
+    if version != 4:
+        return f"FlashAttention {version} resolves for head size {head_size}"
+    return None
+
+
+def flash_attn_per_sequence_support(vllm_config: Any) -> str | None:
+    """Why the FLASH_ATTN backend of this engine cannot apply a per-sequence
+    causal flag, or None when it can. FlashAttention 4 applies the flag through
+    dynamic_causal and FA2/FA3 raise on it, so the version must be set to 4 and
+    resolve to 4 for this model. A FA4 call that carries the flag drops the
+    mm_prefix and R-SWA masks for every sequence in the batch, so models that
+    use them are refused (Gemma-4's "vision" mode clears the mm_prefix ranges
+    on its full-attention layers and is fine). Decode context parallelism has
+    no per-sequence path."""
+    if getattr(vllm_config.attention_config, "flash_attn_version", None) != 4:
+        return "attention_config.flash_attn_version must be set to 4"
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    if getattr(parallel_config, "decode_context_parallel_size", 1) > 1:
+        return "decode context parallelism has no per-sequence path"
+    model_config = vllm_config.model_config
+    if getattr(model_config, "rswa_window", None) is not None:
+        return "R-SWA layers: their mask is dropped beside a per-sequence flag"
+    if getattr(model_config, "is_mm_prefix_lm", False):
+        text_config = getattr(model_config, "hf_text_config", None)
+        if getattr(text_config, "use_bidirectional_attention", None) != "vision":
+            return (
+                "mm_prefix ranges on full-attention layers: their mask is dropped "
+                "beside a per-sequence flag"
+            )
+    return _fa4_platform_reason(vllm_config)
+
+
+def check_bidirectional_request(
+    sampling_params: SamplingParams, vllm_config: Any
+) -> None:
     """Refuse, with a clear error, a bidirectional request this engine cannot
     serve as asked: it needs max_tokens=1; a backend that applies a per-sequence
-    causal flag, set explicitly (TRITON_ATTN, or FLASH_ATTN with
-    flash_attn_version=4; another backend would read the prompt causally and say
-    nothing); and no KV connector, since its KV is not causal and must never be
-    stored or loaded under token hashes."""
+    causal flag, set explicitly (TRITON_ATTN, or FLASH_ATTN where
+    flash_attn_per_sequence_support allows it; another backend would read the
+    prompt causally and say nothing); and no KV connector, since its KV is not
+    causal and must never be stored or loaded under token hashes."""
     if sampling_params.max_tokens != 1:
         raise ValueError(BIDIRECTIONAL_NEEDS_ONE_TOKEN)
     backend = vllm_config.attention_config.backend
-    name = getattr(backend, "name", None) if backend is not None else None
-    fa_version = getattr(vllm_config.attention_config, "flash_attn_version", None)
-    # TRITON_ATTN applies the per-sequence causal flag in its unified kernel;
-    # FLASH_ATTN applies it through FlashAttention 4's dynamic_causal and raises
-    # on FA2/FA3, so it is accepted only with the version set explicitly to 4
-    # (Blackwell picks 4 by default, Hopper needs flash_attn_version=4).
-    if name == "TRITON_ATTN" or (name == "FLASH_ATTN" and fa_version == 4):
-        pass
-    else:
+    name = getattr(backend, "name", None)
+    per_kind = getattr(vllm_config.attention_config, "backend_per_kind", None) or {}
+    kinds = {kind: getattr(b, "name", str(b)) for kind, b in per_kind.items()}
+    fa_reason = (
+        flash_attn_per_sequence_support(vllm_config)
+        if name == "FLASH_ATTN" or "FLASH_ATTN" in kinds.values()
+        else None
+    )
+    accepted = {"TRITON_ATTN"} | ({"FLASH_ATTN"} if fa_reason is None else set())
+    if name not in accepted:
         raise ValueError(
             "attention_mode 'bidirectional' needs --attention-backend TRITON_ATTN, "
-            "or FLASH_ATTN with attention_config.flash_attn_version=4 (got "
-            f"{name or 'auto'}"
-            f"{f', flash_attn_version={fa_version}' if name == 'FLASH_ATTN' else ''}"
-            "): only those apply a per-sequence causal flag"
+            "or FLASH_ATTN with attention_config.flash_attn_version=4 on a CUDA GPU "
+            f"that resolves to FlashAttention 4 for this model (got {name or 'auto'}"
+            f"{'; ' + fa_reason if name == 'FLASH_ATTN' and fa_reason else ''}): "
+            "only those apply a per-sequence causal flag"
         )
-    per_kind = getattr(vllm_config.attention_config, "backend_per_kind", None) or {}
-    allowed = {"TRITON_ATTN"} | ({"FLASH_ATTN"} if fa_version == 4 else set())
-    elsewhere = {
-        kind: getattr(b, "name", str(b))
-        for kind, b in per_kind.items()
-        if getattr(b, "name", None) not in allowed
-    }
+    elsewhere = {kind: b for kind, b in kinds.items() if b not in accepted}
     if elsewhere:
         raise ValueError(
             "attention_mode 'bidirectional' needs a backend that applies the "
             "per-sequence causal flag for every attention kind; backend_per_kind "
             f"routes {elsewhere} to another backend"
+            f"{'; ' + fa_reason if fa_reason else ''}"
         )
     if vllm_config.kv_transfer_config is not None:
         raise ValueError(

@@ -259,7 +259,16 @@ def test_a_deferred_bidirectional_prompt_ages_and_holds_admission(monkeypatch):
     assert scheduler.requests["two_way"].bidirectional_deferrals >= 8
 
 
-def _config(backend_name, kv_connector, per_kind=None, fa_version=None):
+def _config(
+    backend_name,
+    kv_connector,
+    per_kind=None,
+    fa_version=None,
+    dcp=1,
+    rswa=None,
+    mm_prefix=False,
+    bidirectional="none",
+):
     backend = SimpleNamespace(name=backend_name) if backend_name else None
     return SimpleNamespace(
         attention_config=SimpleNamespace(
@@ -270,19 +279,29 @@ def _config(backend_name, kv_connector, per_kind=None, fa_version=None):
             },
             flash_attn_version=fa_version,
         ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp),
+        model_config=SimpleNamespace(
+            rswa_window=rswa,
+            is_mm_prefix_lm=mm_prefix,
+            hf_text_config=SimpleNamespace(use_bidirectional_attention=bidirectional),
+        ),
         kv_transfer_config=SimpleNamespace() if kv_connector else None,
         reasoning_config=None,
     )
 
 
-def test_a_bidirectional_request_is_refused_where_it_cannot_be_served():
+def test_a_bidirectional_request_is_refused_where_it_cannot_be_served(monkeypatch):
     """The frontend refuses, with the reason, a bidirectional request on an engine
-    that would read it causally without saying so (any backend but TRITON_ATTN,
-    including an unset one) or could store or load its non-causal KV through a KV
-    connector; decoding (max_tokens != 1) is refused too. A causal request is never
-    checked."""
+    that would read it causally without saying so (any backend but TRITON_ATTN or
+    FLASH_ATTN with FlashAttention 4, including an unset one) or could store or
+    load its non-causal KV through a KV connector; decoding (max_tokens != 1) is
+    refused too. A causal request is never checked."""
+    import vllm.v1.request as request_module
     from vllm.v1.request import check_bidirectional_request, parse_attention_mode
 
+    # the platform/version part of the FLASH_ATTN check is a GPU question; here
+    # it says "fine" unless a test replaces it
+    monkeypatch.setattr(request_module, "_fa4_platform_reason", lambda cfg: None)
     two_way = SamplingParams(max_tokens=1, extra_args={"attention_mode": "two-way"})
     assert parse_attention_mode(two_way) == "bidirectional"
     assert parse_attention_mode(SamplingParams(max_tokens=1)) == "causal"
@@ -294,6 +313,8 @@ def test_a_bidirectional_request_is_refused_where_it_cannot_be_served():
         check_bidirectional_request(two_way, _config("FLASH_ATTN", False))
     with pytest.raises(ValueError, match="got auto"):
         check_bidirectional_request(two_way, _config(None, False))
+    with pytest.raises(ValueError, match="got auto"):
+        check_bidirectional_request(two_way, _config(None, False, fa_version=4))
     with pytest.raises(ValueError, match="KV connector"):
         check_bidirectional_request(two_way, _config("TRITON_ATTN", True))
     decoding = SamplingParams(max_tokens=4, extra_args={"attention_mode": "two-way"})
@@ -308,30 +329,97 @@ def test_a_bidirectional_request_is_refused_where_it_cannot_be_served():
         two_way, _config("TRITON_ATTN", False, {"full_attention": "TRITON_ATTN"})
     )
     # FLASH_ATTN applies the flag through FlashAttention 4 only: accepted with the
-    # version set explicitly to 4, refused otherwise (FA2/FA3 would raise or, worse,
-    # read causally), per kind as well
+    # version set to 4 (main backend or per kind), refused with 3 or unset
     check_bidirectional_request(two_way, _config("FLASH_ATTN", False, fa_version=4))
-    with pytest.raises(ValueError, match="flash_attn_version"):
-        check_bidirectional_request(two_way, _config("FLASH_ATTN", False))
     with pytest.raises(ValueError, match="flash_attn_version"):
         check_bidirectional_request(two_way, _config("FLASH_ATTN", False, fa_version=3))
     check_bidirectional_request(
         two_way,
-        _config("FLASH_ATTN", False, {"full_attention": "FLASH_ATTN"}, fa_version=4),
+        _config("TRITON_ATTN", False, {"full_attention": "FLASH_ATTN"}, fa_version=4),
     )
     with pytest.raises(ValueError, match="backend_per_kind"):
         check_bidirectional_request(
-            two_way, _config("TRITON_ATTN", False, {"full_attention": "FLASH_ATTN"})
+            two_way,
+            _config(
+                "TRITON_ATTN", False, {"full_attention": "FLASH_ATTN"}, fa_version=3
+            ),
         )
+    # a FA4 call with the flag drops the mm_prefix and R-SWA masks of the whole
+    # batch, and decode context parallelism has no per-sequence path: refused
+    with pytest.raises(ValueError, match="decode context"):
+        check_bidirectional_request(
+            two_way, _config("FLASH_ATTN", False, fa_version=4, dcp=2)
+        )
+    with pytest.raises(ValueError, match="R-SWA"):
+        check_bidirectional_request(
+            two_way, _config("FLASH_ATTN", False, fa_version=4, rswa=4096)
+        )
+    with pytest.raises(ValueError, match="mm_prefix"):
+        check_bidirectional_request(
+            two_way, _config("FLASH_ATTN", False, fa_version=4, mm_prefix=True)
+        )
+    check_bidirectional_request(  # Gemma-4 clears the ranges on its full layers
+        two_way,
+        _config(
+            "FLASH_ATTN", False, fa_version=4, mm_prefix=True, bidirectional="vision"
+        ),
+    )
+    # the platform / resolved-version part is the last word
+    monkeypatch.setattr(
+        request_module, "_fa4_platform_reason", lambda cfg: "FlashAttention 2 resolves"
+    )
+    with pytest.raises(ValueError, match="FlashAttention 2 resolves"):
+        check_bidirectional_request(two_way, _config("FLASH_ATTN", False, fa_version=4))
+    check_bidirectional_request(two_way, _config("TRITON_ATTN", False))  # unaffected
+
+
+def test_the_fa4_dynamic_causal_cache_swap(monkeypatch):
+    """The FLASH_ATTN backend runs a FlashAttention-4 call that carries a
+    per-sequence causal tensor under its own JIT cache (the vendored compile key
+    does not record the tensor), restoring the regular cache afterwards and on
+    an exception; without the tensor nothing is touched or imported."""
+    import sys
+
+    from vllm.v1.attention.backends import flash_attn as fa
+
+    regular = {}
+    fwd = SimpleNamespace(compile_cache=regular)
+    iface = SimpleNamespace(_flash_attn_fwd=fwd)
+    dynamic = {}
+    cute = SimpleNamespace(interface=iface, cache_utils=SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "vllm.vllm_flash_attn.cute", cute)
+    monkeypatch.setitem(sys.modules, "vllm.vllm_flash_attn.cute.interface", iface)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.vllm_flash_attn.cute.cache_utils",
+        SimpleNamespace(get_jit_cache=lambda name: dynamic),
+    )
+    monkeypatch.setattr(fa, "_FA4_DYNAMIC_CAUSAL_CACHE", None)
+    with fa._fa4_cache_for(None):
+        assert fwd.compile_cache is regular
+    assert fa._FA4_DYNAMIC_CAUSAL_CACHE is None  # nothing looked up without a tensor
+    tensor = SimpleNamespace()  # stands in for the int32 flag tensor
+    with fa._fa4_cache_for(tensor):
+        assert fwd.compile_cache is dynamic
+        with fa._fa4_cache_for(tensor):  # nested: still the dynamic cache
+            assert fwd.compile_cache is dynamic
+        assert fwd.compile_cache is dynamic
+    assert fwd.compile_cache is regular
+    with pytest.raises(RuntimeError):  # noqa: SIM117 (the nesting is the point)
+        with fa._fa4_cache_for(tensor):
+            raise RuntimeError("compile failed")
+    assert fwd.compile_cache is regular
 
 
 def test_the_frontend_checks_bidirectional_requests_only(monkeypatch):
     """InputProcessor._validate_params refuses a bidirectional request with a
     VLLMValidationError naming attention_mode, and never checks a causal one."""
+    import vllm.v1.request as request_module
     from vllm.exceptions import VLLMValidationError
     from vllm.v1.engine.input_processor import InputProcessor
 
     monkeypatch.setattr(SamplingParams, "verify", lambda self, *args, **kwargs: None)
+    monkeypatch.setattr(request_module, "_fa4_platform_reason", lambda cfg: None)
 
     def processor(config):
         return SimpleNamespace(

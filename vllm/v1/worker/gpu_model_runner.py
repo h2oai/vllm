@@ -2807,9 +2807,13 @@ class GPUModelRunner(
         """
 
         common_prefix_len = num_common_prefix_blocks * kv_cache_spec.block_size
-        if self.batch_has_bidirectional:
-            # H2O per-request attention: no cascade attention over a shared prefix
-            # when a bidirectional request is in the batch (its KV is not causal)
+        # H2O per-request attention: no cascade attention over a shared prefix
+        # when a bidirectional request is in the batch (its KV is not causal);
+        # read from the batch itself, since this runs before the batch flag is set
+        if any(
+            self.requests[rid].attention_mode == "bidirectional"
+            for rid in self.input_batch.req_ids[: self.input_batch.num_reqs]
+        ):
             common_prefix_len = 0
         if common_prefix_len == 0:
             # Common case.
