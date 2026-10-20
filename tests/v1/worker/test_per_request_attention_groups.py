@@ -100,10 +100,9 @@ def _is_the_tensor(value, tensor):
 
 
 # Gemma-4-like layouts: full layers and sliding layers in two KV-cache groups (the
-# hybrid manager), or in ONE group
-# of uniform type with the sliding spec promoted (the hybrid manager off), where the
-# attention groups still split
-# by the layers' own specs.
+# hybrid manager), or in ONE group of uniform type with the sliding spec promoted
+# (the hybrid manager off), where the attention groups still split by the layers'
+# own specs.
 HYBRID = (
     [
         KVCacheGroupSpec(["full.0", "full.1"], FULL),
@@ -124,9 +123,8 @@ UNIFIED = (
     [[("full", FULL, ["full.0"]), ("swa", PROMOTED_SLIDING, ["swa.0"])]],
 )
 # the hybrid manager off with EQUAL page sizes: every layer in ONE plain merged
-# FullAttentionSpec that carries the
-# sliding window, so the group's spec says "windowed" for the full-attention layers too;
-# only the layers know
+# FullAttentionSpec that carries the sliding window, so the group's spec says
+# "windowed" for the full-attention layers too; only the layers know
 MERGED = (
     [KVCacheGroupSpec(["full.0", "swa.0", "full.1"], PROMOTED_SLIDING)],
     [[("mixed", PROMOTED_SLIDING, ["full.0", "swa.0", "full.1"])]],
@@ -146,8 +144,8 @@ def _attn_groups(layout):
     ]
 
 
-# ---------------------------------------------------------------------------------- the
-# V2 runner (vllm/v1/worker/gpu)
+# ----------------------------------------------------------------------------------
+# the V2 runner (vllm/v1/worker/gpu)
 def _v2_build(
     kv_cache_groups,
     attn_groups,
@@ -344,9 +342,10 @@ class _FakeLayer(AttentionLayerBase):
 @pytest.mark.cpu_test
 def test_windowed_attention_layer_names_from_the_layers():
     """Decided per layer from its own spec, never from a group: sliding, chunked-local
-    and promoted specs are windowed; a layer without a spec of its own (KV-shared,
-    encoder-only) is windowed when its module carries a sliding window; full, plain
-    encoder-only and Mamba layers are not."""
+    and promoted specs are windowed; a layer that returns no spec (encoder-only
+    attention; a KV-shared layer returns one like any other) is windowed when its
+    module carries a sliding window; full, plain encoder-only and Mamba layers are
+    not."""
     layers = {
         "full.0": _FakeLayer(FULL),
         "swa.0": _FakeLayer(SLIDING),
