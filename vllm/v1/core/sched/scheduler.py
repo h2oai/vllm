@@ -1183,9 +1183,9 @@ class Scheduler(SchedulerInterface):
                     ):
                         # The encoder budget (or the prefill lookahead) would
                         # split a bidirectional prompt: wait for a step that
-                        # holds it whole, instead of a partial prefill.
-                        if request.has_encoder_inputs:
-                            self.encoder_cache_manager.free(request)
+                        # holds it whole, instead of a partial prefill. Nothing
+                        # has been allocated for it (the encoder inputs are only
+                        # committed below), so nothing is freed here.
                         request_queue.pop_request()
                         # a prompt whose encoder inputs exceed what ANY step can
                         # encode (the static encoder budget, the encoder cache)
