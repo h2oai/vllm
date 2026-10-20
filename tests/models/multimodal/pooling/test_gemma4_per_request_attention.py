@@ -14,9 +14,9 @@ answer on every clear row, and the two-way answer where the modes disagree) with
 numeric gaps capped; see the bounds below.
 
 Model: google/gemma-4-E4B-it by default (42 layers, 7 full-attention, 18 KV-shared;
-one 80 GB GPU), or GEMMA4_MODEL=<path or repo> (e.g. a larger Gemma-4 checkpoint with
-GEMMA4_QUANT=fp8). About 10 minutes on an H100. Skipped without a CUDA GPU and when
-the model is not accessible (the default repository is gated).
+a 40 GB GPU is enough), or GEMMA4_MODEL=<path or repo> (e.g. a larger Gemma-4
+checkpoint, 80 GB or more in bf16). About 10 minutes on an H100. Skipped without a
+CUDA GPU, below 40 GB, and when the model is not accessible.
 """
 
 import json
@@ -98,8 +98,8 @@ PROMPTS = [
 # logprobs against a pooled hidden state times the label rows), so they differ by
 # numerics: measured on google/gemma-4-E4B-it in bf16 up to 0.09 and 0.14 in two runs
 # (mean 0.02-0.03; the engine's reads were identical between the runs, the pooling
-# reference moved by up to 0.07 on near-tie rows), and on a 31B merge in FP8 up to
-# 0.31 on a three-way near tie (mean 0.05), where the e4m3 activation rounding
+# reference moved by up to 0.07 on near-tie rows), and on a 31B Gemma-4 checkpoint
+# in FP8 up to 0.31 on a three-way near tie (mean 0.05), where the e4m3 rounding
 # amplifies accumulation-order differences. The attention mode moves clear rows by
 # 0.5-0.9. The test is therefore decided on the semantics -- on every row whose own
 # reference is clear (top-2 margin at or above CLEAR_MARGIN) the engine returns the
@@ -108,9 +108,9 @@ PROMPTS = [
 # causal one (at least one such row must exist) -- and the gaps stay under caps that
 # only a wrong mask or readout would reach.
 # Run this test in bf16. Under FP8 the pooling reference itself is not reproducible:
-# on the 31B merge the causal reference moved by up to 0.8 on one row between two
-# runs on the same GPU (the one-engine reads were identical in both), so the FP8 caps
-# below are kept only for exploratory runs with GEMMA4_QUANT=fp8.
+# on the 31B checkpoint the causal reference moved by up to 0.8 on one row between
+# two runs on the same GPU (the one-engine reads were identical in both), so the FP8
+# caps below are kept only for exploratory runs with GEMMA4_QUANT=fp8.
 MAX_ABS_DP = 0.25
 MAX_MEAN_DP = 0.08
 FP8_MAX_ABS_DP = 0.40
@@ -119,12 +119,10 @@ CLEAR_MARGIN = 0.20
 
 
 def _label_rows(model, label_ids):
-    """The lm_head rows of the labels (Gemma ties lm_head to the token embeddings; the
-    checkpoint's lm_head.weight
-    when it has one) read straight from the safetensors shards, and the final logit
-    softcap from the config.
-    Read from the files, not through the engine: a function cannot cross the V1
-    multiprocess executor."""
+    """The lm_head rows of the labels, read straight from the safetensors files (the
+    checkpoint's lm_head.weight when it has one, else the token embeddings Gemma ties
+    the lm_head to), and the final logit softcap from the config. Read from the files,
+    not through the engine: a function cannot cross the V1 multiprocess executor."""
     from huggingface_hub import file_exists, hf_hub_download
     from safetensors import safe_open
     from transformers import AutoConfig
@@ -168,9 +166,7 @@ def _label_rows(model, label_ids):
 
 def _pooling_label_probs(vllm_runner, prompts, W, cap, noncausal):
     """The pooling runner's readout: the last hidden state against the label rows W
-    (taken from the generate
-    engine, whose lm_head is certainly loaded; Gemma ties it to the embeddings) with the
-    final softcap."""
+    (read from the checkpoint files by _label_rows) with the final softcap."""
     hf_overrides = (
         {"text_config": {"noncausal_full_attention": True}} if noncausal else {}
     )
@@ -296,8 +292,12 @@ def test_flagged_read_is_the_two_way_pooling_read_and_unflagged_the_causal_one(
         if r in clear_rows(ref_two_way)
         and int(ref_one_way[r].argmax()) != int(ref_two_way[r].argmax())
     ]
-    print("discriminating rows (clear, different answers):", discriminating)
-    assert discriminating, (ref_one_way, ref_two_way)
+    print(
+        "discriminating rows (clear, different answers):",
+        len(discriminating),
+        discriminating,
+    )
+    assert len(discriminating) >= 1, (ref_one_way, ref_two_way)
     for r in discriminating:
         assert int(one_way[r].argmax()) == int(ref_one_way[r].argmax()), (
             r,
@@ -309,7 +309,18 @@ def test_flagged_read_is_the_two_way_pooling_read_and_unflagged_the_causal_one(
             two_way[r],
             ref_two_way[r],
         )
-    # 3. the numeric gaps stay under the caps
+        # negative control: had the flag been ignored (the flagged read equal to
+        # the unflagged one) or applied to the unflagged request as well, check 2
+        # would have failed on this row
+        assert int(one_way[r].argmax()) != int(ref_two_way[r].argmax()), r
+        assert int(two_way[r].argmax()) != int(ref_one_way[r].argmax()), r
+    # 3. the flagged path's gap to its reference may not exceed the unflagged
+    # (stock) path's gap to its reference by more than 0.02 on the same run: the
+    # two share the engines, the batch and the readouts, so the unflagged gap is
+    # the run's own numeric floor and a feature-specific deviation shows on top
+    # of it; the absolute caps are a sanity bound only
+    assert d_two.max().item() <= d_one.max().item() + 0.02, (d_two, d_one)
+    assert d_two.mean().item() <= d_one.mean().item() + 0.02, (d_two, d_one)
     assert d_one.max().item() <= max_dp and d_one.mean().item() <= mean_dp, (
         one_way,
         ref_one_way,
