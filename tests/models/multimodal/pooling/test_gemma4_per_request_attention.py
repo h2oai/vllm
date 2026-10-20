@@ -60,14 +60,15 @@ def _label_rows(llm, label_ids):
     return llm.apply_model(rows)[0]
 
 
-def _pooling_label_probs(vllm_runner, prompts, label_ids, noncausal):
+def _pooling_label_probs(vllm_runner, prompts, W, cap, noncausal):
+    """The pooling runner's readout: the last hidden state against the label rows W (taken from the generate
+    engine, whose lm_head is certainly loaded; Gemma ties it to the embeddings) with the final softcap."""
     hf_overrides = {"text_config": {"noncausal_full_attention": True}} if noncausal else {}
     with vllm_runner(
         MODEL, runner="pooling", convert="embed",
         pooler_config=PoolerConfig(task="embed", seq_pooling_type="LAST", use_activation=False),
         hf_overrides=hf_overrides, max_model_len=MAX_LEN, enable_prefix_caching=False, quantization=QUANT,
     ) as vllm_model:
-        W, cap = _label_rows(vllm_model.llm, label_ids)
         outputs = vllm_model.llm.embed(prompts, use_tqdm=False)
     h = torch.stack([torch.tensor(o.outputs.embedding) for o in outputs]).float()
     logits = h @ W.T
@@ -77,7 +78,8 @@ def _pooling_label_probs(vllm_runner, prompts, label_ids, noncausal):
 
 
 def _one_engine_label_probs(vllm_runner, prompts, label_ids):
-    """(flagged, unflagged) label distributions from ONE generate engine, the two modes mixed in one batch."""
+    """(flagged, unflagged, W, cap): the label distributions from ONE generate engine, the two modes mixed in one
+    batch, plus the label rows and softcap read from it for the pooling-runner reference."""
     flagged = SamplingParams(max_tokens=1, temperature=0.0, logprobs=len(label_ids), logprob_token_ids=label_ids,
                              extra_args={"attention_mode": "bidirectional"})
     plain = SamplingParams(max_tokens=1, temperature=0.0, logprobs=len(label_ids), logprob_token_ids=label_ids)
@@ -85,6 +87,7 @@ def _one_engine_label_probs(vllm_runner, prompts, label_ids):
         MODEL, attention_backend="TRITON_ATTN", max_model_len=MAX_LEN, max_num_batched_tokens=MAX_LEN,
         quantization=QUANT,
     ) as vllm_model:
+        W, cap = _label_rows(vllm_model.llm, label_ids)
         mixed = [p for pair in zip(prompts, prompts) for p in pair]
         params = [flagged, plain] * len(prompts)
         outputs = vllm_model.llm.generate(mixed, params, use_tqdm=False)
@@ -95,7 +98,7 @@ def _one_engine_label_probs(vllm_runner, prompts, label_ids):
         assert not missing, f"label tokens {missing} missing from the logprobs"
         rows.append(torch.tensor([lp[i].logprob for i in label_ids]))
     probs = torch.softmax(torch.stack(rows), dim=-1)
-    return probs[0::2], probs[1::2]
+    return probs[0::2], probs[1::2], W, cap
 
 
 def test_flagged_read_is_the_two_way_pooling_read_and_unflagged_the_causal_one(vllm_runner):
@@ -103,11 +106,11 @@ def test_flagged_read_is_the_two_way_pooling_read_and_unflagged_the_causal_one(v
 
     tok = AutoTokenizer.from_pretrained(MODEL)
     label_ids = [tok(label, add_special_tokens=False)["input_ids"][-1] for label in LABELS]
-    two_way, one_way = _one_engine_label_probs(vllm_runner, PROMPTS, label_ids)
+    two_way, one_way, W, cap = _one_engine_label_probs(vllm_runner, PROMPTS, label_ids)
     cleanup_dist_env_and_memory()
-    ref_two_way = _pooling_label_probs(vllm_runner, PROMPTS, label_ids, noncausal=True)
+    ref_two_way = _pooling_label_probs(vllm_runner, PROMPTS, W, cap, noncausal=True)
     cleanup_dist_env_and_memory()
-    ref_one_way = _pooling_label_probs(vllm_runner, PROMPTS, label_ids, noncausal=False)
+    ref_one_way = _pooling_label_probs(vllm_runner, PROMPTS, W, cap, noncausal=False)
 
     d_two = (two_way - ref_two_way).abs()
     d_one = (one_way - ref_one_way).abs()
