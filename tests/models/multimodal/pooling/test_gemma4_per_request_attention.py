@@ -9,7 +9,9 @@ distribution the pooling runner gives under the non-causal declaration (full-att
 layers two-way, sliding-window layers causal), and an unflagged request in the SAME
 batch must give the causal pooling readout. Before the per-group causal fix the flagged
 read put a two-sided window on the sliding layers and sat far from the two-way
-reference.
+reference. The test is decided on the answers (each path returns its own reference's
+answer on every clear row, and the two-way answer where the modes disagree) with the
+numeric gaps capped; see the bounds below.
 
 Model: google/gemma-4-E4B-it by default (42 layers, 7 full-attention, 18 KV-shared;
 one 80 GB GPU), or GEMMA4_MODEL=<path or repo> (e.g. a larger Gemma-4 checkpoint with
@@ -91,18 +93,22 @@ PROMPTS = [
         "D: other\nAnswer with the letter of one option only."
     ),
 ]
-# Both sides are vLLM Triton bf16 forwards of the same weights and differ by the
-# kernel path only: the generate runner's unified attention with a per-sequence flag
-# against the pooling runner's encoder-only prefill kernel. The Triton-vs-SDPA gap
-# measured for these readouts was 0.05 at most; the same bound is used here.
-MAX_ABS_DP = 0.05
-MAX_MEAN_DP = 0.01
-# Under FP8 (GEMMA4_QUANT=fp8) two engines of the same weights drift on near-tie
-# prompts (measured: up to 0.25 between two FP8 starts of one engine on the same
-# probe), so the bounds are wider there and the argmax is judged on clear rows only
-# (reference top-2 margin at or above CLEAR_MARGIN).
-FP8_MAX_ABS_DP = 0.30
-FP8_MAX_MEAN_DP = 0.06
+# Both sides are vLLM forwards of the same weights through the same Triton kernels,
+# but in different batches and through different readouts (the generate runner's
+# logprobs against a pooled hidden state times the label rows), so they differ by
+# numerics: measured on google/gemma-4-E4B-it in bf16 up to 0.09 on a near-tie row
+# (mean 0.02), and on a 31B merge in FP8 up to 0.31 on a three-way near tie (mean
+# 0.05), where the e4m3 activation rounding amplifies accumulation-order differences.
+# The attention mode moves clear rows by 0.5-0.9. The test is therefore decided on the
+# semantics -- on every row whose own reference is clear (top-2 margin at or above
+# CLEAR_MARGIN) the engine returns the reference's answer, and on every row where the
+# two references give different clear answers the flagged read returns the two-way
+# answer and the unflagged read the causal one (at least one such row must exist) --
+# and the gaps stay under caps the measured numerics leave room for.
+MAX_ABS_DP = 0.15
+MAX_MEAN_DP = 0.05
+FP8_MAX_ABS_DP = 0.35
+FP8_MAX_MEAN_DP = 0.10
 CLEAR_MARGIN = 0.20
 
 
@@ -256,17 +262,48 @@ def test_flagged_read_is_the_two_way_pooling_read_and_unflagged_the_causal_one(
         d_two.max().item(),
         d_two.mean().item(),
     )
-    for ours, ref in ((one_way, ref_one_way), (two_way, ref_two_way)):
-        clear = [
+
+    def clear_rows(ref):
+        return [
             r
             for r in range(len(PROMPTS))
             if float(ref[r].topk(2).values.diff().abs()) >= CLEAR_MARGIN
         ]
+
+    # 1. each path returns its own reference's answer on every clear row
+    for ours, ref in ((one_way, ref_one_way), (two_way, ref_two_way)):
+        clear = clear_rows(ref)
+        assert clear, ref
         assert all(int(ours[r].argmax()) == int(ref[r].argmax()) for r in clear), (
             clear,
             ours,
             ref,
         )
+    # 2. where the two modes give different clear answers, the flagged read returns
+    # the two-way answer and the unflagged read the causal one (an engine that ignored
+    # the flag, applied it to every request in the batch, or read the sliding layers
+    # two-sided would not land on both). A prompt set without such a row cannot
+    # discriminate and fails here.
+    discriminating = [
+        r
+        for r in clear_rows(ref_one_way)
+        if r in clear_rows(ref_two_way)
+        and int(ref_one_way[r].argmax()) != int(ref_two_way[r].argmax())
+    ]
+    print("discriminating rows (clear, different answers):", discriminating)
+    assert discriminating, (ref_one_way, ref_two_way)
+    for r in discriminating:
+        assert int(one_way[r].argmax()) == int(ref_one_way[r].argmax()), (
+            r,
+            one_way[r],
+            ref_one_way[r],
+        )
+        assert int(two_way[r].argmax()) == int(ref_two_way[r].argmax()), (
+            r,
+            two_way[r],
+            ref_two_way[r],
+        )
+    # 3. the numeric gaps stay under the caps
     assert d_one.max().item() <= max_dp and d_one.mean().item() <= mean_dp, (
         one_way,
         ref_one_way,
@@ -274,14 +311,4 @@ def test_flagged_read_is_the_two_way_pooling_read_and_unflagged_the_causal_one(
     assert d_two.max().item() <= max_dp and d_two.mean().item() <= mean_dp, (
         two_way,
         ref_two_way,
-    )
-    # the flag must change the readout by clearly more than the engine-vs-reference gap
-    # (an engine that ignored
-    # the flag, or read the sliding layers two-sided, would not land on both references
-    # at once)
-    separation = (two_way - one_way).abs().max().item()
-    assert separation > max(2 * d_two.max().item(), 1e-2), (
-        separation,
-        two_way,
-        one_way,
     )
