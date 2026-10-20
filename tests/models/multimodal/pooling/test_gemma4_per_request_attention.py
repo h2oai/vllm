@@ -22,7 +22,9 @@ from vllm.distributed import cleanup_dist_env_and_memory
 
 MODEL = os.environ.get("GEMMA4_MODEL", "google/gemma-4-E4B-it")
 QUANT = os.environ.get("GEMMA4_QUANT") or None
-MAX_LEN = 2048
+MAX_LEN = 4096
+# a text-only test: the merged 31B is multimodal and its image items (2,496 tokens) would need a larger step
+MM_LIMIT = {"image": 0, "video": 0}
 LABELS = [" A", " B", " C", " D"]
 PROMPTS = [
     "State: the order arrived damaged; the customer has a receipt.\n"
@@ -68,6 +70,7 @@ def _pooling_label_probs(vllm_runner, prompts, W, cap, noncausal):
         MODEL, runner="pooling", convert="embed",
         pooler_config=PoolerConfig(task="embed", seq_pooling_type="LAST", use_activation=False),
         hf_overrides=hf_overrides, max_model_len=MAX_LEN, enable_prefix_caching=False, quantization=QUANT,
+        limit_mm_per_prompt=MM_LIMIT,
     ) as vllm_model:
         outputs = vllm_model.llm.embed(prompts, use_tqdm=False)
     h = torch.stack([torch.tensor(o.outputs.embedding) for o in outputs]).float()
@@ -85,7 +88,7 @@ def _one_engine_label_probs(vllm_runner, prompts, label_ids):
     plain = SamplingParams(max_tokens=1, temperature=0.0, logprobs=len(label_ids), logprob_token_ids=label_ids)
     with vllm_runner(
         MODEL, attention_backend="TRITON_ATTN", max_model_len=MAX_LEN, max_num_batched_tokens=MAX_LEN,
-        quantization=QUANT,
+        quantization=QUANT, limit_mm_per_prompt=MM_LIMIT,
     ) as vllm_model:
         W, cap = _label_rows(vllm_model.llm, label_ids)
         mixed = [p for pair in zip(prompts, prompts) for p in pair]
