@@ -152,7 +152,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpecKind,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
-    is_windowed_attention_spec,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.outputs import (
@@ -220,6 +219,7 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import (
     EncoderTimingStats,
     raise_if_nan_logits,
+    windowed_attention_layer_names,
 )
 from vllm.v1.worker.workspace import lock_workspace
 
@@ -227,7 +227,6 @@ from .utils import (
     AttentionGroup,
     KVBlockZeroer,
     add_kv_sharing_layers_to_kv_cache_groups,
-    windowed_attention_layer_names,
     allocate_kv_cache,
     bind_kv_cache,
     copy_kv_cache_blocks_inplace,
@@ -2511,7 +2510,6 @@ class GPUModelRunner(
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
                 kv_cache_spec = kv_cache_spec.kv_cache_specs[attn_group.layer_names[0]]
-            cache_key = (kv_cache_spec, type(builder))
             # H2O per-request attention: the per-sequence causal flag reaches
             # the full-attention layers only; a sliding-window (or
             # chunked-local) layer stays causal for every request, the way
@@ -2530,6 +2528,14 @@ class GPUModelRunner(
             if windowed_names and len(windowed_names) == len(attn_group.layer_names):
                 common_attn_metadata = causal_common_attn_metadata
                 causal_common_attn_metadata = None
+            # the cache key carries the causal kind: a build with the per-sequence
+            # tensor is never reused (through update_block_table) by a group of
+            # windowed layers of the same spec and builder, nor the reverse
+            cache_key = (
+                kv_cache_spec,
+                type(builder),
+                isinstance(common_attn_metadata.causal, torch.Tensor),
+            )
 
             extra_attn_metadata_args = {}
             if use_spec_decode and isinstance(

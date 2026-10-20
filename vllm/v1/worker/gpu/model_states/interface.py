@@ -116,6 +116,7 @@ class ModelState(ABC):
                 self.vllm_config
             )
         return self._windowed_attention_layers
+
     def get_supported_generation_tasks(self) -> tuple[GenerationTask, ...]:
         from vllm.model_executor.models.interfaces import (
             supports_realtime,

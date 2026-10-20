@@ -1001,7 +1001,7 @@ def windowed_attention_layer_names(vllm_config: VllmConfig) -> set[str]:
     kinds of layers. A KV-shared or encoder-only layer (no spec of its own)
     counts as windowed when its module carries a sliding window.
     """
-    from vllm.v1.attention.backend import AttentionLayerBase
+    from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
     from vllm.v1.kv_cache_interface import is_windowed_attention_spec
 
     out: set[str] = set()
