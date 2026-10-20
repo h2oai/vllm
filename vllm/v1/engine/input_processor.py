@@ -31,6 +31,7 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
 from vllm.utils.async_utils import make_async
 from vllm.utils.jsontree import json_iter_leaves
 from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.request import check_bidirectional_request, parse_attention_mode
 
 logger = init_logger(__name__)
 
@@ -100,6 +101,15 @@ class InputProcessor:
                 self.structured_outputs_config,
                 self.tokenizer,
             )
+
+            # H2O per-request attention: a bidirectional request is refused here,
+            # with the reason, when this engine cannot serve it as asked (another
+            # attention backend, a KV connector, decoding requested)
+            try:
+                if parse_attention_mode(params) == "bidirectional":
+                    check_bidirectional_request(params, self.vllm_config)
+            except ValueError as e:
+                raise VLLMValidationError(str(e), parameter="attention_mode") from e
 
             if self.model_config.return_sampling_mask:
                 if params.temperature <= 0:

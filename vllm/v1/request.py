@@ -31,6 +31,57 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+BIDIRECTIONAL_NEEDS_ONE_TOKEN = (
+    "attention_mode 'bidirectional' needs max_tokens=1: the readout is the "
+    "prefill's next-token distribution; no decoding on a bidirectional prefix"
+)
+
+
+def parse_attention_mode(sampling_params: SamplingParams | None) -> str:
+    """H2O per-request attention: the mode a request asks for through
+    ``extra_args`` (``vllm_xargs``) ``attention_mode``: "causal" (the default,
+    alias one_way) or "bidirectional" (alias two_way). Anything else is a
+    ValueError."""
+    if sampling_params is None or not sampling_params.extra_args:
+        return "causal"
+    mode = sampling_params.extra_args.get("attention_mode")
+    if mode is None:
+        return "causal"
+    mode = str(mode).strip().lower().replace("-", "_")
+    if mode in ("one_way", "oneway"):
+        return "causal"
+    if mode in ("two_way", "twoway"):
+        return "bidirectional"
+    if mode not in ("causal", "bidirectional"):
+        raise ValueError(
+            f"attention_mode must be 'causal' or 'bidirectional', got {mode!r}"
+        )
+    return mode
+
+
+def check_bidirectional_request(sampling_params: SamplingParams, vllm_config) -> None:
+    """Refuse, with a clear error, a bidirectional request this engine cannot
+    serve as asked: it needs max_tokens=1; the TRITON_ATTN backend, set
+    explicitly, which is the only backend that applies a per-sequence causal
+    flag (another backend would read the prompt causally and say nothing); and
+    no KV connector, since its KV is not causal and must never be stored or
+    loaded under token hashes."""
+    if sampling_params.max_tokens != 1:
+        raise ValueError(BIDIRECTIONAL_NEEDS_ONE_TOKEN)
+    backend = vllm_config.attention_config.backend
+    if backend is None or getattr(backend, "name", None) != "TRITON_ATTN":
+        raise ValueError(
+            "attention_mode 'bidirectional' needs --attention-backend TRITON_ATTN "
+            "(got "
+            f"{getattr(backend, 'name', None) if backend is not None else 'auto'}): "
+            "it is the only backend that applies a per-sequence causal flag"
+        )
+    if vllm_config.kv_transfer_config is not None:
+        raise ValueError(
+            "attention_mode 'bidirectional' cannot be served with a KV connector: "
+            "its KV is not causal and must never be stored or loaded through one"
+        )
+
 
 @dataclass
 class StreamingUpdate:
@@ -225,28 +276,15 @@ class Request:
         # metadata); it is prefill-only (max_tokens == 1: the next-token logits
         # of the prefill are the readout), is never chunked, and never shares KV
         # blocks with the prefix cache in either direction (its KV is not causal).
-        self.attention_mode = "causal"
-        if sampling_params is not None and sampling_params.extra_args:
-            mode = sampling_params.extra_args.get("attention_mode")
-            if mode is not None:
-                mode = str(mode).strip().lower().replace("-", "_")
-                if mode in ("one_way", "oneway"):
-                    mode = "causal"
-                elif mode in ("two_way", "twoway"):
-                    mode = "bidirectional"
-                if mode not in ("causal", "bidirectional"):
-                    raise ValueError(
-                        f"attention_mode must be 'causal' or 'bidirectional', got {mode!r}"
-                    )
-                self.attention_mode = mode
+        self.attention_mode = parse_attention_mode(sampling_params)
         if self.attention_mode == "bidirectional":
-            logger.debug("H2O per-request attention: request %s bidirectional (prefill-only, no prefix cache)", request_id)
+            logger.debug(
+                "H2O per-request attention: request %s bidirectional "
+                "(prefill-only, no prefix cache)",
+                request_id,
+            )
             if self.max_tokens != 1:
-                raise ValueError(
-                    "attention_mode 'bidirectional' needs max_tokens=1: the readout "
-                    "is the prefill's next-token distribution; no decoding on a "
-                    "bidirectional prefix"
-                )
+                raise ValueError(BIDIRECTIONAL_NEEDS_ONE_TOKEN)
             block_hasher = None  # no prefix-cache reads or writes for this request
         # steps this request was deferred for lack of room (bounded aging in the
         # scheduler)
