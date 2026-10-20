@@ -32,6 +32,14 @@ from vllm.distributed import cleanup_dist_env_and_memory
 
 MODEL = os.environ.get("GEMMA4_MODEL", "google/gemma-4-E4B-it")
 QUANT = os.environ.get("GEMMA4_QUANT") or None
+# the generate engine's attention backend: TRITON_ATTN (default) applies the
+# per-sequence flag in its unified kernel; FLASH_ATTN applies it through
+# FlashAttention 4 (GEMMA4_FA_VERSION=4; Hopper needs it set, Blackwell picks it)
+BACKEND = os.environ.get("GEMMA4_BACKEND", "TRITON_ATTN")
+FA_VERSION = int(os.environ.get("GEMMA4_FA_VERSION", "0")) or None
+ENGINE_EXTRA = (
+    {"attention_config": {"flash_attn_version": FA_VERSION}} if FA_VERSION else {}
+)
 
 
 def _model_accessible() -> bool:
@@ -193,6 +201,14 @@ def _pooling_label_probs(vllm_runner, prompts, W, cap, noncausal):
     return torch.softmax(logits, dim=-1)
 
 
+def _engine_steps(llm):
+    """Engine iterations so far (the count of vllm:iteration_tokens_total)."""
+    for metric in llm.get_metrics():
+        if metric.name == "vllm:iteration_tokens_total":
+            return int(metric.count)
+    raise AssertionError("vllm:iteration_tokens_total not in LLM.get_metrics()")
+
+
 def _one_engine_label_probs(vllm_runner, prompts, label_ids):
     """(flagged, unflagged) label distributions from ONE generate engine, the two modes
     mixed in one batch."""
@@ -211,7 +227,8 @@ def _one_engine_label_probs(vllm_runner, prompts, label_ids):
     )
     with vllm_runner(
         MODEL,
-        attention_backend="TRITON_ATTN",
+        attention_backend=BACKEND,
+        **ENGINE_EXTRA,
         max_model_len=MAX_LEN,
         max_num_batched_tokens=MAX_LEN,
         quantization=QUANT,
@@ -219,7 +236,14 @@ def _one_engine_label_probs(vllm_runner, prompts, label_ids):
     ) as vllm_model:
         mixed = [p for pair in zip(prompts, prompts) for p in pair]
         params = [flagged, plain] * len(prompts)
+        steps_before = _engine_steps(vllm_model.llm)
         outputs = vllm_model.llm.generate(mixed, params, use_tqdm=False)
+        # the mixed batch (flagged and unflagged prompts, 12 prompts of ~60
+        # tokens against a 4,096-token step) is prefilled in ONE engine step:
+        # the two subsets share the step, nothing is serialised
+        steps = _engine_steps(vllm_model.llm) - steps_before
+        print("engine steps for the mixed batch:", steps)
+        assert steps == 1, steps
     rows = []
     for out in outputs:
         lp = out.outputs[0].logprobs[0]

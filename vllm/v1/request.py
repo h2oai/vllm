@@ -61,32 +61,42 @@ def parse_attention_mode(sampling_params: SamplingParams | None) -> str:
 
 def check_bidirectional_request(sampling_params: SamplingParams, vllm_config) -> None:
     """Refuse, with a clear error, a bidirectional request this engine cannot
-    serve as asked: it needs max_tokens=1; the TRITON_ATTN backend, set
-    explicitly, which is the only backend that applies a per-sequence causal
-    flag (another backend would read the prompt causally and say nothing); and
-    no KV connector, since its KV is not causal and must never be stored or
-    loaded under token hashes."""
+    serve as asked: it needs max_tokens=1; a backend that applies a per-sequence
+    causal flag, set explicitly (TRITON_ATTN, or FLASH_ATTN with
+    flash_attn_version=4; another backend would read the prompt causally and say
+    nothing); and no KV connector, since its KV is not causal and must never be
+    stored or loaded under token hashes."""
     if sampling_params.max_tokens != 1:
         raise ValueError(BIDIRECTIONAL_NEEDS_ONE_TOKEN)
     backend = vllm_config.attention_config.backend
-    if backend is None or getattr(backend, "name", None) != "TRITON_ATTN":
+    name = getattr(backend, "name", None) if backend is not None else None
+    fa_version = getattr(vllm_config.attention_config, "flash_attn_version", None)
+    # TRITON_ATTN applies the per-sequence causal flag in its unified kernel;
+    # FLASH_ATTN applies it through FlashAttention 4's dynamic_causal and raises
+    # on FA2/FA3, so it is accepted only with the version set explicitly to 4
+    # (Blackwell picks 4 by default, Hopper needs flash_attn_version=4).
+    if name == "TRITON_ATTN" or (name == "FLASH_ATTN" and fa_version == 4):
+        pass
+    else:
         raise ValueError(
-            "attention_mode 'bidirectional' needs --attention-backend TRITON_ATTN "
-            "(got "
-            f"{getattr(backend, 'name', None) if backend is not None else 'auto'}): "
-            "it is the only backend that applies a per-sequence causal flag"
+            "attention_mode 'bidirectional' needs --attention-backend TRITON_ATTN, "
+            "or FLASH_ATTN with attention_config.flash_attn_version=4 (got "
+            f"{name or 'auto'}"
+            f"{f', flash_attn_version={fa_version}' if name == 'FLASH_ATTN' else ''}"
+            "): only those apply a per-sequence causal flag"
         )
     per_kind = getattr(vllm_config.attention_config, "backend_per_kind", None) or {}
+    allowed = {"TRITON_ATTN"} | ({"FLASH_ATTN"} if fa_version == 4 else set())
     elsewhere = {
         kind: getattr(b, "name", str(b))
         for kind, b in per_kind.items()
-        if getattr(b, "name", None) != "TRITON_ATTN"
+        if getattr(b, "name", None) not in allowed
     }
     if elsewhere:
         raise ValueError(
-            "attention_mode 'bidirectional' needs TRITON_ATTN for every attention "
-            f"kind; backend_per_kind routes {elsewhere} to another backend, which "
-            "would ignore the per-sequence causal flag"
+            "attention_mode 'bidirectional' needs a backend that applies the "
+            "per-sequence causal flag for every attention kind; backend_per_kind "
+            f"routes {elsewhere} to another backend"
         )
     if vllm_config.kv_transfer_config is not None:
         raise ValueError(

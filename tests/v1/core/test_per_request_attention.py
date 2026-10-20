@@ -259,7 +259,7 @@ def test_a_deferred_bidirectional_prompt_ages_and_holds_admission(monkeypatch):
     assert scheduler.requests["two_way"].bidirectional_deferrals >= 8
 
 
-def _config(backend_name, kv_connector, per_kind=None):
+def _config(backend_name, kv_connector, per_kind=None, fa_version=None):
     backend = SimpleNamespace(name=backend_name) if backend_name else None
     return SimpleNamespace(
         attention_config=SimpleNamespace(
@@ -268,6 +268,7 @@ def _config(backend_name, kv_connector, per_kind=None):
                 kind: SimpleNamespace(name=name)
                 for kind, name in (per_kind or {}).items()
             },
+            flash_attn_version=fa_version,
         ),
         kv_transfer_config=SimpleNamespace() if kv_connector else None,
         reasoning_config=None,
@@ -306,6 +307,22 @@ def test_a_bidirectional_request_is_refused_where_it_cannot_be_served():
     check_bidirectional_request(
         two_way, _config("TRITON_ATTN", False, {"full_attention": "TRITON_ATTN"})
     )
+    # FLASH_ATTN applies the flag through FlashAttention 4 only: accepted with the
+    # version set explicitly to 4, refused otherwise (FA2/FA3 would raise or, worse,
+    # read causally), per kind as well
+    check_bidirectional_request(two_way, _config("FLASH_ATTN", False, fa_version=4))
+    with pytest.raises(ValueError, match="flash_attn_version"):
+        check_bidirectional_request(two_way, _config("FLASH_ATTN", False))
+    with pytest.raises(ValueError, match="flash_attn_version"):
+        check_bidirectional_request(two_way, _config("FLASH_ATTN", False, fa_version=3))
+    check_bidirectional_request(
+        two_way,
+        _config("FLASH_ATTN", False, {"full_attention": "FLASH_ATTN"}, fa_version=4),
+    )
+    with pytest.raises(ValueError, match="backend_per_kind"):
+        check_bidirectional_request(
+            two_way, _config("TRITON_ATTN", False, {"full_attention": "FLASH_ATTN"})
+        )
 
 
 def test_the_frontend_checks_bidirectional_requests_only(monkeypatch):
