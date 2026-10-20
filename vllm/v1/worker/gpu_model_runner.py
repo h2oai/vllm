@@ -240,6 +240,7 @@ from .utils import (
     AttentionGroup,
     KVBlockZeroer,
     add_kv_sharing_layers_to_kv_cache_groups,
+    windowed_attention_layer_names,
     allocate_kv_cache,
     bind_kv_cache,
     copy_kv_cache_blocks_inplace,
@@ -840,6 +841,9 @@ class GPUModelRunner(
             self.max_num_reqs + 1, dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
         )
         self.batch_has_bidirectional = False
+        # the windowed attention layers (sliding or chunked-local), from the
+        # model's layers at first use: they stay causal for a bidirectional request
+        self._windowed_attention_layers: set[str] | None = None
         self.per_seq_causal_gpu = torch.ones(
             self.max_num_reqs + 1, dtype=torch.int32, device=self.device
         )
@@ -2319,6 +2323,16 @@ class GPUModelRunner(
             int(num_sampled_tokens.max()),
         )
 
+    @property
+    def windowed_attention_layers(self) -> set[str]:
+        """H2O per-request attention: the attention layers that attend through a
+        window of their own; see windowed_attention_layer_names."""
+        if self._windowed_attention_layers is None:
+            self._windowed_attention_layers = windowed_attention_layer_names(
+                self.vllm_config
+            )
+        return self._windowed_attention_layers
+
     def _build_attention_metadata(
         self,
         num_tokens: int,
@@ -2559,16 +2573,24 @@ class GPUModelRunner(
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
                 kv_cache_spec = kv_cache_spec.kv_cache_specs[attn_group.layer_names[0]]
             cache_key = (kv_cache_spec, type(builder))
-            if isinstance(
-                common_attn_metadata.causal, torch.Tensor
-            ) and is_windowed_attention_spec(kv_cache_spec):
-                # H2O per-request attention: the per-sequence causal flag
-                # reaches the full-attention layers only; a sliding-window
-                # (or chunked-local) layer stays causal for every request,
-                # the way the two-way reading is trained (Gemma-4's sliding
-                # layers keep their causal window). The same tensor on every
-                # group gave a bidirectional request a two-sided window there.
-                common_attn_metadata = common_attn_metadata.replace(causal=True)
+            # H2O per-request attention: the per-sequence causal flag reaches
+            # the full-attention layers only; a sliding-window (or
+            # chunked-local) layer stays causal for every request, the way
+            # the two-way reading is trained (Gemma-4's sliding layers keep
+            # their causal window). Windowed-ness comes from each LAYER
+            # (windowed_attention_layers): a group's spec can be one merged
+            # FullAttentionSpec covering both kinds of layers (hybrid KV cache
+            # manager off), and such a group is built twice.
+            windowed_names: set[str] = set()
+            if isinstance(common_attn_metadata.causal, torch.Tensor):
+                windowed = self.windowed_attention_layers
+                windowed_names = {n for n in attn_group.layer_names if n in windowed}
+            causal_common_attn_metadata = (
+                common_attn_metadata.replace(causal=True) if windowed_names else None
+            )
+            if windowed_names and len(windowed_names) == len(attn_group.layer_names):
+                common_attn_metadata = causal_common_attn_metadata
+                causal_common_attn_metadata = None
 
             cascade_attn_prefix_len = (
                 cascade_attn_prefix_lens[kv_cache_gid][attn_gid]
@@ -2632,8 +2654,25 @@ class GPUModelRunner(
                 assert isinstance(attn_metadata, list)
                 attn_metadata_dict = attn_metadata[ubid]
 
+            causal_attn_metadata_i = None
+            if causal_common_attn_metadata is not None:
+                # the windowed layers of a mixed group: their own build, causal
+                causal_attn_metadata_i = (
+                    builder.build_for_cudagraph_capture(causal_common_attn_metadata)
+                    if for_cudagraph_capture
+                    else builder.build(
+                        common_prefix_len=cascade_attn_prefix_len,
+                        common_attn_metadata=causal_common_attn_metadata,
+                        **extra_attn_metadata_args,
+                    )
+                )
             for layer_name in attn_group.layer_names:
-                attn_metadata_dict[layer_name] = attn_metadata_i
+                windowed_here = (
+                    causal_attn_metadata_i is not None and layer_name in windowed_names
+                )
+                attn_metadata_dict[layer_name] = (
+                    causal_attn_metadata_i if windowed_here else attn_metadata_i
+                )
 
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
@@ -4061,8 +4100,17 @@ class GPUModelRunner(
                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
             )
 
+        # H2O per-request attention: a batch with a bidirectional request never
+        # replays a FULL cudagraph (captured with the causal kernel: the
+        # per-sequence flag would be ignored); piecewise graphs run the
+        # attention eagerly.
+        has_bidirectional = any(
+            self.requests[rid].attention_mode == "bidirectional"
+            for rid in self.input_batch.req_ids[:num_reqs]
+        )
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
-            num_tokens_padded, disable_full=use_cascade_attn or has_encoder_output
+            num_tokens_padded,
+            disable_full=use_cascade_attn or has_encoder_output or has_bidirectional,
         )
         num_tokens_padded = batch_descriptor.num_tokens
         if self.compilation_config.pass_config.enable_sp:
