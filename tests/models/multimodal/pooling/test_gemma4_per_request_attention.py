@@ -96,19 +96,25 @@ PROMPTS = [
 # Both sides are vLLM forwards of the same weights through the same Triton kernels,
 # but in different batches and through different readouts (the generate runner's
 # logprobs against a pooled hidden state times the label rows), so they differ by
-# numerics: measured on google/gemma-4-E4B-it in bf16 up to 0.09 on a near-tie row
-# (mean 0.02), and on a 31B merge in FP8 up to 0.31 on a three-way near tie (mean
-# 0.05), where the e4m3 activation rounding amplifies accumulation-order differences.
-# The attention mode moves clear rows by 0.5-0.9. The test is therefore decided on the
-# semantics -- on every row whose own reference is clear (top-2 margin at or above
-# CLEAR_MARGIN) the engine returns the reference's answer, and on every row where the
-# two references give different clear answers the flagged read returns the two-way
-# answer and the unflagged read the causal one (at least one such row must exist) --
-# and the gaps stay under caps the measured numerics leave room for.
-MAX_ABS_DP = 0.15
-MAX_MEAN_DP = 0.05
-FP8_MAX_ABS_DP = 0.35
-FP8_MAX_MEAN_DP = 0.10
+# numerics: measured on google/gemma-4-E4B-it in bf16 up to 0.09 and 0.14 in two runs
+# (mean 0.02-0.03; the engine's reads were identical between the runs, the pooling
+# reference moved by up to 0.07 on near-tie rows), and on a 31B merge in FP8 up to
+# 0.31 on a three-way near tie (mean 0.05), where the e4m3 activation rounding
+# amplifies accumulation-order differences. The attention mode moves clear rows by
+# 0.5-0.9. The test is therefore decided on the semantics -- on every row whose own
+# reference is clear (top-2 margin at or above CLEAR_MARGIN) the engine returns the
+# reference's answer, and on every row where the two references give different clear
+# answers the flagged read returns the two-way answer and the unflagged read the
+# causal one (at least one such row must exist) -- and the gaps stay under caps that
+# only a wrong mask or readout would reach.
+# Run this test in bf16. Under FP8 the pooling reference itself is not reproducible:
+# on the 31B merge the causal reference moved by up to 0.8 on one row between two
+# runs on the same GPU (the one-engine reads were identical in both), so the FP8 caps
+# below are kept only for exploratory runs with GEMMA4_QUANT=fp8.
+MAX_ABS_DP = 0.25
+MAX_MEAN_DP = 0.08
+FP8_MAX_ABS_DP = 0.40
+FP8_MAX_MEAN_DP = 0.12
 CLEAR_MARGIN = 0.20
 
 
