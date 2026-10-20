@@ -1,24 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Gemma-4 per-request attention on ONE generate engine against the pooling-runner two-
-way read (GPU).
+"""Gemma-4 per-request attention on ONE generate engine against the pooling runner's
+two-way read (GPU).
 
 A request flagged ``vllm_xargs attention_mode=bidirectional`` on a stock-config Gemma-4
-(generate runner, Triton
-attention, the prompt prefilled whole) must give the label distribution the pooling
-runner gives under the non-causal
-declaration (full-attention layers two-way, sliding-window layers causal); an unflagged
-request in the SAME batch
-must give the causal pooling readout. Before the per-group causal fix the flagged read
-put a two-sided window on the
-sliding layers and sat far from the two-way reference.
+(generate runner, Triton attention, the prompt prefilled whole) must give the label
+distribution the pooling runner gives under the non-causal declaration (full-attention
+layers two-way, sliding-window layers causal), and an unflagged request in the SAME
+batch must give the causal pooling readout. Before the per-group causal fix the flagged
+read put a two-sided window on the sliding layers and sat far from the two-way
+reference.
 
-Model: google/gemma-4-E4B-it by default (42 layers, 7 full-attention, 18 KV-shared; one
-80 GB GPU), or
-GEMMA4_MODEL=<path or repo> (e.g. a larger Gemma-4 checkpoint with GEMMA4_QUANT=fp8).
-About 10 minutes on an
-H100. Skipped without a CUDA GPU and when the model is not accessible (the default
-repository is gated).
+Model: google/gemma-4-E4B-it by default (42 layers, 7 full-attention, 18 KV-shared;
+one 80 GB GPU), or GEMMA4_MODEL=<path or repo> (e.g. a larger Gemma-4 checkpoint with
+GEMMA4_QUANT=fp8). About 10 minutes on an H100. Skipped without a CUDA GPU and when
+the model is not accessible (the default repository is gated).
 """
 
 import json
@@ -55,9 +51,6 @@ pytestmark = [
         torch.cuda.is_available()
         and torch.cuda.get_device_properties(0).total_memory < 40 * 2**30,
         reason="needs a GPU with at least 40 GB",
-    ),
-    pytest.mark.skipif(
-        not _model_accessible(), reason=f"model {MODEL} is not accessible here"
     ),
 ]
 MAX_LEN = 4096
@@ -98,12 +91,10 @@ PROMPTS = [
         "D: other\nAnswer with the letter of one option only."
     ),
 ]
-# Both sides are vLLM Triton bf16 forwards of the same weights; they differ by the
-# kernel path only (the generate
-# runner's unified attention with a per-sequence flag vs the pooling runner's encoder-
-# only prefill kernel). The
-# Triton-vs-SDPA gap measured for these readouts was 0.05 max; the same bound is used
-# here.
+# Both sides are vLLM Triton bf16 forwards of the same weights and differ by the
+# kernel path only: the generate runner's unified attention with a per-sequence flag
+# against the pooling runner's encoder-only prefill kernel. The Triton-vs-SDPA gap
+# measured for these readouts was 0.05 at most; the same bound is used here.
 MAX_ABS_DP = 0.05
 MAX_MEAN_DP = 0.01
 
@@ -218,6 +209,8 @@ def _one_engine_label_probs(vllm_runner, prompts, label_ids):
 def test_flagged_read_is_the_two_way_pooling_read_and_unflagged_the_causal_one(
     vllm_runner,
 ):
+    if not _model_accessible():  # at run time, not at collection: a network call
+        pytest.skip(f"model {MODEL} is not accessible here")
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(MODEL)
