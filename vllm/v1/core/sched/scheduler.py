@@ -1135,6 +1135,44 @@ class Scheduler(SchedulerInterface):
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
 
+                    # H2O per-request attention: a bidirectional prompt is
+                    # prefilled in ONE step (its full-attention layers read the
+                    # whole prompt), so it is checked here, before any clamp
+                    # (long_prefill_token_threshold below, the encoder budget
+                    # later) could split it: over the real per-step cap it can
+                    # never fit and is finished with an error for this request
+                    # only (in update_from_output, which emits the output with
+                    # finish_reason "error"); over this step's budget it waits
+                    # for a step with the room.
+                    bidirectional = (
+                        getattr(request, "attention_mode", "causal") == "bidirectional"
+                    )
+                    if bidirectional:
+                        # the static cap of one step (input_budget above is this
+                        # step's remaining budget)
+                        step_cap = min(
+                            self.max_num_scheduled_tokens,
+                            self.scheduler_config.max_num_batched_tokens - draft_slots,
+                        )
+                        if num_new_tokens > step_cap:
+                            logger.warning(
+                                "bidirectional request %s: the prompt (%d tokens) "
+                                "exceeds what one step holds (%d tokens: "
+                                "max_num_batched_tokens less the draft slots); a "
+                                "bidirectional prompt is prefilled in one step, "
+                                "raise --max-num-batched-tokens",
+                                request.request_id,
+                                num_new_tokens,
+                                step_cap,
+                            )
+                            request_queue.pop_request()
+                            self.bidirectional_error_reqs.add(request.request_id)
+                            continue
+                        if num_new_tokens > request_token_budget:
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
+
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
                     # Not for diffusion where draft tokens can't be padded.
@@ -1159,7 +1197,7 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens = padded_num_tokens
                             pad_spec_decode = True
 
-                    if 0 < long_prefill_token_threshold < num_new_tokens:
+                    if 0 < long_prefill_token_threshold < num_new_tokens and not bidirectional:
                         num_new_tokens = long_prefill_token_threshold
 
                     # chunked prefill has to be enabled explicitly to allow
@@ -1172,35 +1210,6 @@ class Scheduler(SchedulerInterface):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
                         break
-
-                    if (
-                        getattr(request, "attention_mode", "causal") == "bidirectional"
-                        and num_new_tokens > request_token_budget
-                    ):
-                        # A bidirectional prompt must be prefilled in one step
-                        # (its full-attention layers read the whole prompt);
-                        # wait for a step with the budget.
-                        if num_new_tokens > self.max_num_scheduled_tokens:
-                            # It can never fit a step: finish it with an error for
-                            # this request only (the engine keeps serving).
-                            logger.warning(
-                                "bidirectional request %s: the prompt (%d tokens) "
-                                "exceeds max_num_batched_tokens (%d); a bidirectional "
-                                "prompt is prefilled in one step, raise "
-                                "--max-num-batched-tokens (e.g. to --max-model-len)",
-                                request.request_id,
-                                num_new_tokens,
-                                self.max_num_scheduled_tokens,
-                            )
-                            request_queue.pop_request()
-                            # finished in update_from_output, which emits the
-                            # output with finish_reason "error" (freeing it here
-                            # left the client without any output: it hung)
-                            self.bidirectional_error_reqs.add(request.request_id)
-                            continue
-                        request_queue.pop_request()
-                        step_skipped_waiting.prepend_request(request)
-                        continue
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
                     assert num_new_tokens > 0
@@ -1254,6 +1263,19 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = self._reserve_prefill_lookahead(
                         request, num_computed_tokens, num_new_tokens
                     )
+
+                    if (
+                        bidirectional
+                        and num_new_tokens != request.num_tokens - num_computed_tokens
+                    ):
+                        # The encoder budget (or the prefill lookahead) would
+                        # split a bidirectional prompt: wait for a step that
+                        # holds it whole, instead of a partial prefill.
+                        if request.has_encoder_inputs:
+                            self.encoder_cache_manager.free(request)
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
 
                     if num_new_tokens == 0:
                         # The request cannot be scheduled.
@@ -2347,9 +2369,12 @@ class Scheduler(SchedulerInterface):
         self.grammar_compile_error_reqs.clear()
         error_req_ids.update(self.encoder_cache_mismatch_reqs)
         self.encoder_cache_mismatch_reqs.clear()
-        # H2O per-request attention: bidirectional prompts over the one-step window
-        error_req_ids.update(self.bidirectional_error_reqs)
-        self.bidirectional_error_reqs.clear()
+        # H2O per-request attention: bidirectional prompts over the one-step
+        # window (getattr: a test may build a Scheduler without __init__)
+        bidirectional_error_reqs = getattr(self, "bidirectional_error_reqs", None)
+        if bidirectional_error_reqs:
+            error_req_ids.update(bidirectional_error_reqs)
+            bidirectional_error_reqs.clear()
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             error_req_ids.update(failed_kv_load_req_ids)
         if self.ec_connector is not None:
