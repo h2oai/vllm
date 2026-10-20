@@ -113,30 +113,37 @@ def _label_rows(model, label_ids):
     softcap from the config.
     Read from the files, not through the engine: a function cannot cross the V1
     multiprocess executor."""
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import file_exists, hf_hub_download
     from safetensors import safe_open
     from transformers import AutoConfig
 
+    local = os.path.isdir(model)
+
     def fetch(name):
+        return os.path.join(model, name) if local else hf_hub_download(model, name)
+
+    def present(name):
         return (
-            name
-            if os.path.isdir(model) and os.path.exists(os.path.join(model, name))
-            else hf_hub_download(model, name)
+            os.path.exists(os.path.join(model, name))
+            if local
+            else file_exists(model, name)
         )
 
-    local = os.path.isdir(model)
-    index_path = (
-        os.path.join(model, "model.safetensors.index.json")
-        if local
-        else fetch("model.safetensors.index.json")
-    )
-    with open(index_path) as f:
-        index = json.load(f)
-    weight_map = index["weight_map"]
-    key = next((k for k in weight_map if k.endswith("lm_head.weight")), None) or next(
-        k for k in weight_map if k.endswith("embed_tokens.weight")
-    )
-    shard = os.path.join(model, weight_map[key]) if local else fetch(weight_map[key])
+    def pick(keys):
+        return next((k for k in keys if k.endswith("lm_head.weight")), None) or next(
+            k for k in keys if k.endswith("embed_tokens.weight")
+        )
+
+    if present("model.safetensors.index.json"):
+        with open(fetch("model.safetensors.index.json")) as f:
+            weight_map = json.load(f)["weight_map"]
+        key = pick(weight_map)
+        shard = fetch(weight_map[key])
+    else:
+        # a single-file checkpoint (google/gemma-4-E4B-it ships one model.safetensors)
+        shard = fetch("model.safetensors")
+        with safe_open(shard, "pt") as f:
+            key = pick(list(f.keys()))
     with safe_open(shard, "pt") as f:
         W = f.get_slice(key)[label_ids].float()
     cap = getattr(
