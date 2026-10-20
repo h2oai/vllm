@@ -1,14 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Gemma-4 per-request attention on ONE generate engine against the pooling-runner two-way read (GPU).
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Gemma-4 per-request attention on ONE generate engine against the pooling-runner two-
+way read (GPU).
 
-A request flagged ``vllm_xargs attention_mode=bidirectional`` on a stock-config Gemma-4 (generate runner, Triton
-attention, the prompt prefilled whole) must give the label distribution the pooling runner gives under the non-causal
-declaration (full-attention layers two-way, sliding-window layers causal); an unflagged request in the SAME batch
-must give the causal pooling readout. Before the per-group causal fix the flagged read put a two-sided window on the
+A request flagged ``vllm_xargs attention_mode=bidirectional`` on a stock-config Gemma-4
+(generate runner, Triton
+attention, the prompt prefilled whole) must give the label distribution the pooling
+runner gives under the non-causal
+declaration (full-attention layers two-way, sliding-window layers causal); an unflagged
+request in the SAME batch
+must give the causal pooling readout. Before the per-group causal fix the flagged read
+put a two-sided window on the
 sliding layers and sat far from the two-way reference.
 
-Model: google/gemma-4-E4B-it by default (42 layers, 7 full-attention, 18 KV-shared; one 80 GB GPU), or
-GEMMA4_MODEL=<path or repo> (e.g. the 31B merge with GEMMA4_QUANT=fp8). About 10 minutes on an H100.
+Model: google/gemma-4-E4B-it by default (42 layers, 7 full-attention, 18 KV-shared; one
+80 GB GPU), or
+GEMMA4_MODEL=<path or repo> (e.g. a larger Gemma-4 checkpoint with GEMMA4_QUANT=fp8).
+About 10 minutes on an
+H100. Skipped without a CUDA GPU and when the model is not accessible (the default
+repository is gated).
 """
 
 import json
@@ -23,68 +33,141 @@ from vllm.distributed import cleanup_dist_env_and_memory
 
 MODEL = os.environ.get("GEMMA4_MODEL", "google/gemma-4-E4B-it")
 QUANT = os.environ.get("GEMMA4_QUANT") or None
+
+
+def _model_accessible() -> bool:
+    """A local folder, or a Hub repository this environment may read (the default is
+    gated)."""
+    if os.path.isdir(MODEL):
+        return True
+    try:
+        from huggingface_hub import auth_check
+
+        auth_check(MODEL)
+        return True
+    except Exception:  # noqa: BLE001 - gated, missing, or offline: skip either way
+        return False
+
+
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU"),
+    pytest.mark.skipif(
+        torch.cuda.is_available()
+        and torch.cuda.get_device_properties(0).total_memory < 40 * 2**30,
+        reason="needs a GPU with at least 40 GB",
+    ),
+    pytest.mark.skipif(
+        not _model_accessible(), reason=f"model {MODEL} is not accessible here"
+    ),
+]
 MAX_LEN = 4096
-# a text-only test: the merged 31B is multimodal and its image items (2,496 tokens) would need a larger step
+# a text-only test: a multimodal Gemma-4 checkpoint's image items (2,496 tokens) would
+# need a larger step
 MM_LIMIT = {"image": 0, "video": 0}
 LABELS = [" A", " B", " C", " D"]
 PROMPTS = [
-    "State: the order arrived damaged; the customer has a receipt.\n"
-    "Question: which team handles this?\nA: returns\nB: billing\nC: technical\n"
-    "D: other\nAnswer with the letter of one option only.",
-    "State: invoice 4471 was charged twice on the same day.\n"
-    "Question: which team handles this?\nA: returns\nB: billing\nC: technical\n"
-    "D: other\nAnswer with the letter of one option only.",
-    "State: the device reboots whenever the firmware update starts.\n"
-    "Question: which team handles this?\nA: returns\nB: billing\nC: technical\n"
-    "D: other\nAnswer with the letter of one option only.",
-    "State: the parcel was delivered to a neighbour who kept it; the sender wants a refund.\n"
-    "Question: which team handles this?\nA: returns\nB: billing\nC: technical\n"
-    "D: other\nAnswer with the letter of one option only.",
-    "State: the app shows a blank screen after the login step on Android 14.\n"
-    "Question: which team handles this?\nA: returns\nB: billing\nC: technical\n"
-    "D: other\nAnswer with the letter of one option only.",
-    "State: a customer asks whether the store is open on public holidays.\n"
-    "Question: which team handles this?\nA: returns\nB: billing\nC: technical\n"
-    "D: other\nAnswer with the letter of one option only.",
+    (
+        "State: the order arrived damaged; the customer has a receipt.\n"
+        "Question: which team handles this?\nA: returns\nB: billing\nC: technical\n"
+        "D: other\nAnswer with the letter of one option only."
+    ),
+    (
+        "State: invoice 4471 was charged twice on the same day.\n"
+        "Question: which team handles this?\nA: returns\nB: billing\nC: technical\n"
+        "D: other\nAnswer with the letter of one option only."
+    ),
+    (
+        "State: the device reboots whenever the firmware update starts.\n"
+        "Question: which team handles this?\nA: returns\nB: billing\nC: technical\n"
+        "D: other\nAnswer with the letter of one option only."
+    ),
+    (
+        "State: the parcel was delivered to a neighbour who kept it; the sender "
+        "wants a refund.\n"
+        "Question: which team handles this?\nA: returns\nB: billing\nC: technical\n"
+        "D: other\nAnswer with the letter of one option only."
+    ),
+    (
+        "State: the app shows a blank screen after the login step on Android 14.\n"
+        "Question: which team handles this?\nA: returns\nB: billing\nC: technical\n"
+        "D: other\nAnswer with the letter of one option only."
+    ),
+    (
+        "State: a customer asks whether the store is open on public holidays.\n"
+        "Question: which team handles this?\nA: returns\nB: billing\nC: technical\n"
+        "D: other\nAnswer with the letter of one option only."
+    ),
 ]
-# Both sides are vLLM Triton bf16 forwards of the same weights; they differ by the kernel path only (the generate
-# runner's unified attention with a per-sequence flag vs the pooling runner's encoder-only prefill kernel). The
-# Triton-vs-SDPA gap measured for these readouts was 0.05 max; the same bound is used here.
+# Both sides are vLLM Triton bf16 forwards of the same weights; they differ by the
+# kernel path only (the generate
+# runner's unified attention with a per-sequence flag vs the pooling runner's encoder-
+# only prefill kernel). The
+# Triton-vs-SDPA gap measured for these readouts was 0.05 max; the same bound is used
+# here.
 MAX_ABS_DP = 0.05
 MAX_MEAN_DP = 0.01
 
 
 def _label_rows(model, label_ids):
-    """The lm_head rows of the labels (Gemma ties lm_head to the token embeddings; the checkpoint's lm_head.weight
-    when it has one) read straight from the safetensors shards, and the final logit softcap from the config.
-    Read from the files, not through the engine: a function cannot cross the V1 multiprocess executor."""
+    """The lm_head rows of the labels (Gemma ties lm_head to the token embeddings; the
+    checkpoint's lm_head.weight
+    when it has one) read straight from the safetensors shards, and the final logit
+    softcap from the config.
+    Read from the files, not through the engine: a function cannot cross the V1
+    multiprocess executor."""
     from huggingface_hub import hf_hub_download
     from safetensors import safe_open
     from transformers import AutoConfig
 
     def fetch(name):
-        return name if os.path.isdir(model) and os.path.exists(os.path.join(model, name)) else hf_hub_download(model, name)
+        return (
+            name
+            if os.path.isdir(model) and os.path.exists(os.path.join(model, name))
+            else hf_hub_download(model, name)
+        )
 
     local = os.path.isdir(model)
-    index = json.load(open(os.path.join(model, "model.safetensors.index.json") if local else fetch("model.safetensors.index.json")))
+    index_path = (
+        os.path.join(model, "model.safetensors.index.json")
+        if local
+        else fetch("model.safetensors.index.json")
+    )
+    with open(index_path) as f:
+        index = json.load(f)
     weight_map = index["weight_map"]
-    key = next((k for k in weight_map if k.endswith("lm_head.weight")), None) or \
-        next(k for k in weight_map if k.endswith("embed_tokens.weight"))
+    key = next((k for k in weight_map if k.endswith("lm_head.weight")), None) or next(
+        k for k in weight_map if k.endswith("embed_tokens.weight")
+    )
     shard = os.path.join(model, weight_map[key]) if local else fetch(weight_map[key])
     with safe_open(shard, "pt") as f:
         W = f.get_slice(key)[label_ids].float()
-    cap = getattr(AutoConfig.from_pretrained(model).get_text_config(), "final_logit_softcapping", None)
+    cap = getattr(
+        AutoConfig.from_pretrained(model).get_text_config(),
+        "final_logit_softcapping",
+        None,
+    )
     return W, (float(cap) if cap else 0.0)
 
 
 def _pooling_label_probs(vllm_runner, prompts, W, cap, noncausal):
-    """The pooling runner's readout: the last hidden state against the label rows W (taken from the generate
-    engine, whose lm_head is certainly loaded; Gemma ties it to the embeddings) with the final softcap."""
-    hf_overrides = {"text_config": {"noncausal_full_attention": True}} if noncausal else {}
+    """The pooling runner's readout: the last hidden state against the label rows W
+    (taken from the generate
+    engine, whose lm_head is certainly loaded; Gemma ties it to the embeddings) with the
+    final softcap."""
+    hf_overrides = (
+        {"text_config": {"noncausal_full_attention": True}} if noncausal else {}
+    )
     with vllm_runner(
-        MODEL, runner="pooling", convert="embed",
-        pooler_config=PoolerConfig(task="embed", seq_pooling_type="LAST", use_activation=False),
-        hf_overrides=hf_overrides, max_model_len=MAX_LEN, enable_prefix_caching=False, quantization=QUANT,
+        MODEL,
+        runner="pooling",
+        convert="embed",
+        pooler_config=PoolerConfig(
+            task="embed", seq_pooling_type="LAST", use_activation=False
+        ),
+        hf_overrides=hf_overrides,
+        max_model_len=MAX_LEN,
+        enable_prefix_caching=False,
+        quantization=QUANT,
         limit_mm_per_prompt=MM_LIMIT,
     ) as vllm_model:
         outputs = vllm_model.llm.embed(prompts, use_tqdm=False)
@@ -96,13 +179,28 @@ def _pooling_label_probs(vllm_runner, prompts, W, cap, noncausal):
 
 
 def _one_engine_label_probs(vllm_runner, prompts, label_ids):
-    """(flagged, unflagged) label distributions from ONE generate engine, the two modes mixed in one batch."""
-    flagged = SamplingParams(max_tokens=1, temperature=0.0, logprobs=len(label_ids), logprob_token_ids=label_ids,
-                             extra_args={"attention_mode": "bidirectional"})
-    plain = SamplingParams(max_tokens=1, temperature=0.0, logprobs=len(label_ids), logprob_token_ids=label_ids)
+    """(flagged, unflagged) label distributions from ONE generate engine, the two modes
+    mixed in one batch."""
+    flagged = SamplingParams(
+        max_tokens=1,
+        temperature=0.0,
+        logprobs=len(label_ids),
+        logprob_token_ids=label_ids,
+        extra_args={"attention_mode": "bidirectional"},
+    )
+    plain = SamplingParams(
+        max_tokens=1,
+        temperature=0.0,
+        logprobs=len(label_ids),
+        logprob_token_ids=label_ids,
+    )
     with vllm_runner(
-        MODEL, attention_backend="TRITON_ATTN", max_model_len=MAX_LEN, max_num_batched_tokens=MAX_LEN,
-        quantization=QUANT, limit_mm_per_prompt=MM_LIMIT,
+        MODEL,
+        attention_backend="TRITON_ATTN",
+        max_model_len=MAX_LEN,
+        max_num_batched_tokens=MAX_LEN,
+        quantization=QUANT,
+        limit_mm_per_prompt=MM_LIMIT,
     ) as vllm_model:
         mixed = [p for pair in zip(prompts, prompts) for p in pair]
         params = [flagged, plain] * len(prompts)
@@ -117,11 +215,15 @@ def _one_engine_label_probs(vllm_runner, prompts, label_ids):
     return probs[0::2], probs[1::2]
 
 
-def test_flagged_read_is_the_two_way_pooling_read_and_unflagged_the_causal_one(vllm_runner):
+def test_flagged_read_is_the_two_way_pooling_read_and_unflagged_the_causal_one(
+    vllm_runner,
+):
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(MODEL)
-    label_ids = [tok(label, add_special_tokens=False)["input_ids"][-1] for label in LABELS]
+    label_ids = [
+        tok(label, add_special_tokens=False)["input_ids"][-1] for label in LABELS
+    ]
     W, cap = _label_rows(MODEL, label_ids)
     two_way, one_way = _one_engine_label_probs(vllm_runner, PROMPTS, label_ids)
     cleanup_dist_env_and_memory()
@@ -131,9 +233,21 @@ def test_flagged_read_is_the_two_way_pooling_read_and_unflagged_the_causal_one(v
 
     d_two = (two_way - ref_two_way).abs()
     d_one = (one_way - ref_one_way).abs()
-    assert d_one.max().item() <= MAX_ABS_DP and d_one.mean().item() <= MAX_MEAN_DP, (one_way, ref_one_way)
-    assert d_two.max().item() <= MAX_ABS_DP and d_two.mean().item() <= MAX_MEAN_DP, (two_way, ref_two_way)
-    # the flag must change the readout by clearly more than the engine-vs-reference gap (an engine that ignored
-    # the flag, or read the sliding layers two-sided, would not land on both references at once)
+    assert d_one.max().item() <= MAX_ABS_DP and d_one.mean().item() <= MAX_MEAN_DP, (
+        one_way,
+        ref_one_way,
+    )
+    assert d_two.max().item() <= MAX_ABS_DP and d_two.mean().item() <= MAX_MEAN_DP, (
+        two_way,
+        ref_two_way,
+    )
+    # the flag must change the readout by clearly more than the engine-vs-reference gap
+    # (an engine that ignored
+    # the flag, or read the sliding layers two-sided, would not land on both references
+    # at once)
     separation = (two_way - one_way).abs().max().item()
-    assert separation > max(2 * d_two.max().item(), 1e-2), (separation, two_way, one_way)
+    assert separation > max(2 * d_two.max().item(), 1e-2), (
+        separation,
+        two_way,
+        one_way,
+    )
