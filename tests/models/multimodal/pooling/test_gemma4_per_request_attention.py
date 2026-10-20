@@ -201,12 +201,26 @@ def _pooling_label_probs(vllm_runner, prompts, W, cap, noncausal):
     return torch.softmax(logits, dim=-1)
 
 
-def _engine_steps(llm):
-    """Engine iterations so far (the count of vllm:iteration_tokens_total)."""
+def _iteration_histogram(llm):
+    """The engine's vllm:iteration_tokens_total histogram: (count, sum, buckets),
+    buckets mapping each upper limit to the cumulative count of iterations."""
     for metric in llm.get_metrics():
         if metric.name == "vllm:iteration_tokens_total":
-            return int(metric.count)
+            return int(metric.count), float(metric.sum), dict(metric.buckets)
     raise AssertionError("vllm:iteration_tokens_total not in LLM.get_metrics()")
+
+
+def _iterations_above(before, after, tokens):
+    """Iterations between two histogram readings that carried more than
+    ``tokens`` tokens (the largest bucket limit not above ``tokens`` bounds the
+    count below it)."""
+    count0, _, buckets0 = before
+    count1, _, buckets1 = after
+    limits = [float(k) for k in buckets1 if k != "+Inf" and float(k) <= tokens]
+    if not limits:
+        return count1 - count0
+    key = next(k for k in buckets1 if k != "+Inf" and float(k) == max(limits))
+    return (count1 - count0) - (buckets1[key] - buckets0.get(key, 0))
 
 
 def _one_engine_label_probs(vllm_runner, prompts, label_ids):
@@ -237,14 +251,34 @@ def _one_engine_label_probs(vllm_runner, prompts, label_ids):
     ) as vllm_model:
         mixed = [p for pair in zip(prompts, prompts) for p in pair]
         params = [flagged, plain] * len(prompts)
-        steps_before = _engine_steps(vllm_model.llm)
+        before = _iteration_histogram(vllm_model.llm)
         outputs = vllm_model.llm.generate(mixed, params, use_tqdm=False)
+        after = _iteration_histogram(vllm_model.llm)
         # the mixed batch (flagged and unflagged prompts, 12 prompts of ~60
         # tokens against a 4,096-token step) is prefilled in ONE engine step:
-        # the two subsets share the step, nothing is serialised
-        steps = _engine_steps(vllm_model.llm) - steps_before
-        print("engine steps for the mixed batch:", steps)
-        assert steps == 1, steps
+        # the two subsets share the step, nothing is serialised. Async
+        # scheduling may add one near-empty iteration (the decode step it
+        # schedules before the finish is seen), so the check is on the
+        # iteration that carried the prompts, not on the raw count.
+        total = sum(len(o.prompt_token_ids) for o in outputs)
+        iterations = after[0] - before[0]
+        big = _iterations_above(before, after, total / 2)
+        print(
+            "mixed batch:",
+            total,
+            "prompt tokens in",
+            iterations,
+            "iterations;",
+            big,
+            "iteration(s) above half the tokens",
+        )
+        assert iterations <= 2 and big == 1 and after[1] - before[1] >= total, (
+            total,
+            iterations,
+            big,
+            before,
+            after,
+        )
     rows = []
     for out in outputs:
         lp = out.outputs[0].logprobs[0]
