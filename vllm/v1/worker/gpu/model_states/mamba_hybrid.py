@@ -327,8 +327,18 @@ class MambaHybridModelState(DefaultModelState):
             positions=input_batch.positions,
             model_specific_attn_metadata=mamba_attn_metadata,
             for_cudagraph_capture=for_capture,
-            causal=(input_batch.attention_causal if input_batch.attention_causal is not None else True),
-            windowed_layers=self.windowed_attention_layers,
+            causal=(
+                input_batch.attention_causal
+                if input_batch.attention_causal is not None
+                else True
+            ),
+            # the layer set is only needed (and only computed) for a batch that
+            # carries a per-sequence flag; the stock path passes nothing
+            windowed_layers=(
+                self.windowed_attention_layers
+                if input_batch.attention_causal is not None
+                else None
+            ),
             rswa_prefix_lens=input_batch.prompt_lens,
         )
         if self.recoverssm is not None:

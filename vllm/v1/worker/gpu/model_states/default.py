@@ -225,8 +225,18 @@ class DefaultModelState(ModelState):
             is_prefilling=torch.from_numpy(input_batch.is_prefilling_np),
             mm_req_doc_ranges=req_doc_ranges,
             for_cudagraph_capture=for_capture,
-            causal=(input_batch.attention_causal if input_batch.attention_causal is not None else True),
-            windowed_layers=self.windowed_attention_layers,
+            causal=(
+                input_batch.attention_causal
+                if input_batch.attention_causal is not None
+                else True
+            ),
+            # the layer set is only needed (and only computed) for a batch that
+            # carries a per-sequence flag; the stock path passes nothing
+            windowed_layers=(
+                self.windowed_attention_layers
+                if input_batch.attention_causal is not None
+                else None
+            ),
             rswa_prefix_lens=input_batch.prompt_lens,
             req_idx=input_batch.idx_mapping_np,
             ubatch_idx=ubatch_idx,
