@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
@@ -510,7 +511,8 @@ def build_attn_metadata(
         group_causal = (
             causal if isinstance(causal, (bool, torch.Tensor)) else causal.get(i, True)
         )
-        if isinstance(group_causal, torch.Tensor):
+        if isinstance(group_causal, torch.Tensor) and logger.isEnabledFor(logging.DEBUG):
+            # .tolist() syncs the device: only when DEBUG is on
             logger.debug("H2O per-request attention: group %d gets a per-sequence causal tensor %s", i, group_causal.tolist())
 
         common_attn_metadata_extra_kwargs = (
