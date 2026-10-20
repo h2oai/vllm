@@ -228,6 +228,7 @@ def _one_engine_label_probs(vllm_runner, prompts, label_ids):
     with vllm_runner(
         MODEL,
         attention_backend=BACKEND,
+        disable_log_stats=False,  # LLM.get_metrics() for the step count below
         **ENGINE_EXTRA,
         max_model_len=MAX_LEN,
         max_num_batched_tokens=MAX_LEN,
