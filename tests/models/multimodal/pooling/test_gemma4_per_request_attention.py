@@ -11,6 +11,7 @@ Model: google/gemma-4-E4B-it by default (42 layers, 7 full-attention, 18 KV-shar
 GEMMA4_MODEL=<path or repo> (e.g. the 31B merge with GEMMA4_QUANT=fp8). About 10 minutes on an H100.
 """
 
+import json
 import os
 
 import pytest
@@ -53,13 +54,27 @@ MAX_ABS_DP = 0.05
 MAX_MEAN_DP = 0.01
 
 
-def _label_rows(llm, label_ids):
-    """The lm_head rows of the labels and the final logit softcap, read inside the worker."""
-    def rows(model):
-        head = getattr(model, "lm_head", None) or getattr(model.language_model, "lm_head")
-        cap = getattr(getattr(model, "logits_processor", None), "soft_cap", None)
-        return head.weight[label_ids].float().cpu(), (float(cap) if cap else 0.0)
-    return llm.apply_model(rows)[0]
+def _label_rows(model, label_ids):
+    """The lm_head rows of the labels (Gemma ties lm_head to the token embeddings; the checkpoint's lm_head.weight
+    when it has one) read straight from the safetensors shards, and the final logit softcap from the config.
+    Read from the files, not through the engine: a function cannot cross the V1 multiprocess executor."""
+    from huggingface_hub import hf_hub_download
+    from safetensors import safe_open
+    from transformers import AutoConfig
+
+    def fetch(name):
+        return name if os.path.isdir(model) and os.path.exists(os.path.join(model, name)) else hf_hub_download(model, name)
+
+    local = os.path.isdir(model)
+    index = json.load(open(os.path.join(model, "model.safetensors.index.json") if local else fetch("model.safetensors.index.json")))
+    weight_map = index["weight_map"]
+    key = next((k for k in weight_map if k.endswith("lm_head.weight")), None) or \
+        next(k for k in weight_map if k.endswith("embed_tokens.weight"))
+    shard = os.path.join(model, weight_map[key]) if local else fetch(weight_map[key])
+    with safe_open(shard, "pt") as f:
+        W = f.get_slice(key)[label_ids].float()
+    cap = getattr(AutoConfig.from_pretrained(model).get_text_config(), "final_logit_softcapping", None)
+    return W, (float(cap) if cap else 0.0)
 
 
 def _pooling_label_probs(vllm_runner, prompts, W, cap, noncausal):
@@ -81,8 +96,7 @@ def _pooling_label_probs(vllm_runner, prompts, W, cap, noncausal):
 
 
 def _one_engine_label_probs(vllm_runner, prompts, label_ids):
-    """(flagged, unflagged, W, cap): the label distributions from ONE generate engine, the two modes mixed in one
-    batch, plus the label rows and softcap read from it for the pooling-runner reference."""
+    """(flagged, unflagged) label distributions from ONE generate engine, the two modes mixed in one batch."""
     flagged = SamplingParams(max_tokens=1, temperature=0.0, logprobs=len(label_ids), logprob_token_ids=label_ids,
                              extra_args={"attention_mode": "bidirectional"})
     plain = SamplingParams(max_tokens=1, temperature=0.0, logprobs=len(label_ids), logprob_token_ids=label_ids)
@@ -90,7 +104,6 @@ def _one_engine_label_probs(vllm_runner, prompts, label_ids):
         MODEL, attention_backend="TRITON_ATTN", max_model_len=MAX_LEN, max_num_batched_tokens=MAX_LEN,
         quantization=QUANT, limit_mm_per_prompt=MM_LIMIT,
     ) as vllm_model:
-        W, cap = _label_rows(vllm_model.llm, label_ids)
         mixed = [p for pair in zip(prompts, prompts) for p in pair]
         params = [flagged, plain] * len(prompts)
         outputs = vllm_model.llm.generate(mixed, params, use_tqdm=False)
@@ -101,7 +114,7 @@ def _one_engine_label_probs(vllm_runner, prompts, label_ids):
         assert not missing, f"label tokens {missing} missing from the logprobs"
         rows.append(torch.tensor([lp[i].logprob for i in label_ids]))
     probs = torch.softmax(torch.stack(rows), dim=-1)
-    return probs[0::2], probs[1::2], W, cap
+    return probs[0::2], probs[1::2]
 
 
 def test_flagged_read_is_the_two_way_pooling_read_and_unflagged_the_causal_one(vllm_runner):
@@ -109,7 +122,8 @@ def test_flagged_read_is_the_two_way_pooling_read_and_unflagged_the_causal_one(v
 
     tok = AutoTokenizer.from_pretrained(MODEL)
     label_ids = [tok(label, add_special_tokens=False)["input_ids"][-1] for label in LABELS]
-    two_way, one_way, W, cap = _one_engine_label_probs(vllm_runner, PROMPTS, label_ids)
+    W, cap = _label_rows(MODEL, label_ids)
+    two_way, one_way = _one_engine_label_probs(vllm_runner, PROMPTS, label_ids)
     cleanup_dist_env_and_memory()
     ref_two_way = _pooling_label_probs(vllm_runner, PROMPTS, W, cap, noncausal=True)
     cleanup_dist_env_and_memory()
