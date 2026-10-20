@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -10,7 +10,6 @@ import numpy as np
 import torch
 
 import vllm.envs as envs
-from vllm.logger import init_logger
 from vllm.config import (
     VllmConfig,
     get_layers_from_vllm_config,
@@ -484,6 +483,7 @@ def build_attn_metadata(
     ubatch_idx: int = 0,
     fast_prefill: FastPrefillBatchMetadata | None = None,
     req_idx: np.ndarray | None = None,
+    windowed_layers: Collection[str] | None = None,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -511,9 +511,16 @@ def build_attn_metadata(
         group_causal = (
             causal if isinstance(causal, (bool, torch.Tensor)) else causal.get(i, True)
         )
-        if isinstance(group_causal, torch.Tensor) and logger.isEnabledFor(logging.DEBUG):
+        if isinstance(group_causal, torch.Tensor) and logger.isEnabledFor(
+            logging.DEBUG
+        ):
             # .tolist() syncs the device: only when DEBUG is on
-            logger.debug("H2O per-request attention: group %d gets a per-sequence causal tensor %s", i, group_causal.tolist())
+            logger.debug(
+                "H2O per-request attention: group %d gets a per-sequence causal "
+                "tensor %s",
+                i,
+                group_causal.tolist(),
+            )
 
         common_attn_metadata_extra_kwargs = (
             model_specific_attn_metadata.get_extra_common_attn_kwargs(i, num_reqs)
@@ -556,17 +563,20 @@ def build_attn_metadata(
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(ubatch_idx)
-            group_common_attn_metadata = common_attn_metadata
-            if isinstance(group_causal, torch.Tensor) and is_windowed_attention_spec(
-                attn_group.kv_cache_spec
-            ):
-                # H2O per-request attention: the per-sequence causal flag
-                # reaches the full-attention layers only; a sliding-window (or
-                # chunked-local) layer stays causal for every request, the way
-                # the two-way reading is trained (Gemma-4's sliding layers keep
-                # their causal window). attn_group.kv_cache_spec is the layer's
-                # own spec, also inside a UniformTypeKVCacheSpecs group.
-                group_common_attn_metadata = common_attn_metadata.replace(causal=True)
+
+            def build(cm: CommonAttentionMetadata, builder=attn_metadata_builder) -> Any:
+                if for_cudagraph_capture:
+                    return attn_group.build_metadata_for_cudagraph_capture(cm, ubatch_idx)
+                attn_metadata_extra_kwargs = (
+                    model_specific_attn_metadata.get_extra_attn_kwargs(
+                        builder,
+                        num_reqs,
+                    )
+                    if model_specific_attn_metadata is not None
+                    else {}
+                )
+                return attn_group.build_metadata(cm, ubatch_idx, **attn_metadata_extra_kwargs)
+
             reuse_key = None
             if attn_metadata_builder.supports_update_block_table and isinstance(
                 attn_group.kv_cache_spec, MambaSpec
@@ -576,26 +586,38 @@ def build_attn_metadata(
                 metadata = attn_metadata_builder.update_block_table(
                     cached_metadata[reuse_key], block_table, slot_mapping
                 )
-            elif for_cudagraph_capture:
-                metadata = attn_group.build_metadata_for_cudagraph_capture(
-                    group_common_attn_metadata, ubatch_idx
-                )
+                for layer_name in attn_group.layer_names:
+                    attn_metadata[layer_name] = metadata
+                continue
+
+            # H2O per-request attention: the per-sequence causal flag reaches
+            # the full-attention layers only; a sliding-window (or
+            # chunked-local) layer stays causal for every request, the way the
+            # two-way reading is trained (Gemma-4's sliding layers keep their
+            # causal window). Windowed-ness comes from the layer
+            # (windowed_layers, see windowed_attention_layer_names), else from
+            # the group's own spec; a group holding both kinds (a merged
+            # FullAttentionSpec, hybrid KV cache manager off) is built twice.
+            windowed_names: set[str] = set()
+            if isinstance(group_causal, torch.Tensor):
+                if windowed_layers is not None:
+                    windowed_names = {
+                        n for n in attn_group.layer_names if n in windowed_layers
+                    }
+                elif is_windowed_attention_spec(attn_group.kv_cache_spec):
+                    windowed_names = set(attn_group.layer_names)
+            if windowed_names:
+                causal_metadata = build(common_attn_metadata.replace(causal=True))
+            if windowed_names and len(windowed_names) == len(attn_group.layer_names):
+                metadata = causal_metadata
             else:
-                attn_metadata_extra_kwargs = (
-                    model_specific_attn_metadata.get_extra_attn_kwargs(
-                        attn_metadata_builder,
-                        num_reqs,
-                    )
-                    if model_specific_attn_metadata is not None
-                    else {}
-                )
-                metadata = attn_group.build_metadata(
-                    group_common_attn_metadata, ubatch_idx, **attn_metadata_extra_kwargs
-                )
+                metadata = build(common_attn_metadata)
             if reuse_key is not None and reuse_key not in cached_metadata:
                 cached_metadata[reuse_key] = metadata
             for layer_name in attn_group.layer_names:
-                attn_metadata[layer_name] = metadata
+                attn_metadata[layer_name] = (
+                    causal_metadata if layer_name in windowed_names else metadata
+                )
         token_to_req_indices = common_attn_metadata._token_to_req_indices_cache
     return attn_metadata
 

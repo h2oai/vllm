@@ -52,6 +52,9 @@ class ModelState(ABC):
     ) -> None:
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
+        # H2O per-request attention: the windowed attention layers (sliding or
+        # chunked-local), computed from the model's layers at first use
+        self._windowed_attention_layers: set[str] | None = None
         self.scheduler_config = vllm_config.scheduler_config
         self.model = model
         self.device = device
@@ -100,6 +103,19 @@ class ModelState(ABC):
         # Auto-fit can reduce the limit after model state initialization.
         return self.model_config.max_model_len
 
+
+    @property
+    def windowed_attention_layers(self) -> set[str]:
+        """The attention layers that attend through a window of their own
+        (H2O per-request attention keeps them causal for a bidirectional
+        request); see windowed_attention_layer_names."""
+        if self._windowed_attention_layers is None:
+            from vllm.v1.worker.utils import windowed_attention_layer_names
+
+            self._windowed_attention_layers = windowed_attention_layer_names(
+                self.vllm_config
+            )
+        return self._windowed_attention_layers
     def get_supported_generation_tasks(self) -> tuple[GenerationTask, ...]:
         from vllm.model_executor.models.interfaces import (
             supports_realtime,

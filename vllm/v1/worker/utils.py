@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm.config import CacheConfig
+from vllm.config import CacheConfig, VllmConfig, get_layers_from_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import share_replayssm_ring_trackers
@@ -990,3 +990,28 @@ class EncoderTimingStats:
             "encoder_forward_secs": self.encoder_forward_secs,
             "num_encoder_calls": self.num_encoder_calls,
         }
+
+
+def windowed_attention_layer_names(vllm_config: VllmConfig) -> set[str]:
+    """H2O per-request attention: the attention layers that attend through a
+    window of their own (sliding-window or chunked-local), decided from EACH
+    LAYER's own KV cache spec (its sliding window / chunk size), not from the
+    KV cache group it lands in: with the hybrid KV cache manager off and equal
+    page sizes, one merged FullAttentionSpec (sliding_window set) covers both
+    kinds of layers. A KV-shared or encoder-only layer (no spec of its own)
+    counts as windowed when its module carries a sliding window.
+    """
+    from vllm.v1.attention.backend import AttentionLayerBase
+    from vllm.v1.kv_cache_interface import is_windowed_attention_spec
+
+    out: set[str] = set()
+    layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
+    for name, layer in layers.items():
+        spec = layer.get_kv_cache_spec(vllm_config)
+        if spec is not None and not isinstance(spec, UniformTypeKVCacheSpecs):
+            windowed = is_windowed_attention_spec(spec)
+        else:
+            windowed = getattr(layer, "sliding_window", None) is not None
+        if windowed:
+            out.add(name)
+    return out
