@@ -1,20 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""H2O per-request attention: the per-sequence causal flag reaches the FULL-attention
+"""H2O per-request attention: the per-sequence causal flag reaches the full-attention
 layers only.
 
 A request with ``vllm_xargs attention_mode=bidirectional`` reads its full-attention
-layers in both directions; its
-sliding-window (or chunked-local) layers stay causal, the way the two-way reading is
-trained (Gemma-4: 50 sliding
-layers with a causal window, 10 full layers). Both GPU runners build the attention
-metadata per KV-cache / attention
-group, and used to hand the same per-sequence tensor to every group, so a flagged
-sequence got a two-sided window on
-the sliding layers. Now a windowed group gets plain ``True``, a full-attention group the
-tensor, and an unflagged
-batch is unchanged (``True`` everywhere). CPU only: fake metadata builders record what
-they were given.
+layers in both directions; its sliding-window (or chunked-local) layers stay causal,
+the way the two-way reading is trained (Gemma-4: 50 sliding layers with a causal
+window, 10 full layers). Both GPU runners build the attention metadata per KV-cache /
+attention group and used to hand the same per-sequence tensor to every group, so a
+flagged sequence got a two-sided window on the sliding layers. Now a windowed layer
+gets plain ``True``, a full-attention layer the tensor, and an unflagged batch is
+unchanged (``True`` everywhere). CPU only: fake metadata builders record what they
+were given.
 """
 
 from types import SimpleNamespace
@@ -22,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -35,7 +33,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-from vllm.v1.worker.utils import AttentionGroup
+from vllm.v1.worker.utils import AttentionGroup, windowed_attention_layer_names
 
 _ATTN = dict(block_size=16, num_kv_heads=2, head_size=64, dtype=torch.float16)
 FULL = FullAttentionSpec(**_ATTN)
@@ -207,10 +205,9 @@ def test_v2_unflagged_batch_is_unchanged(layout):
 
 @pytest.mark.cpu_test
 def test_v2_without_a_layer_set_the_group_spec_decides():
-    """No windowed_layers (a caller without the model): the group's own spec decides,
-    which is right for the
-    hybrid-manager and unified layouts and wrong-but-safe (all causal) for a merged
-    group."""
+    """Without windowed_layers (a caller without the model) the group's own spec
+    decides: right for the hybrid-manager and unified layouts, and wrong but safe (all
+    causal) for a merged group."""
     kv_cache_groups, groups = HYBRID
     flags = torch.tensor([0, 1], dtype=torch.int32)
     md = _v2_build(kv_cache_groups, _attn_groups(groups), flags, windowed_layers=None)
@@ -240,9 +237,9 @@ def test_v2_per_group_bool_mapping_of_the_hybrid_drafters_is_untouched():
 # ------------------------------------------------------------------- the V1 runner
 # (vllm/v1/worker/gpu_model_runner)
 def _v1_runner(kv_cache_groups, attn_groups, modes):
-    """A bare GPUModelRunner on the CPU with just what _build_attention_metadata reads;
-    `modes` = the attention
-    mode of requests "a" and "b", both prompts of 4 tokens, prefilled in this step."""
+    """A bare GPUModelRunner on the CPU with just what _build_attention_metadata
+    reads; `modes` are the attention modes of requests "a" and "b", both prompts of 4
+    tokens, prefilled in this step."""
     max_num_reqs = 4
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.device = torch.device("cpu")
@@ -327,3 +324,83 @@ def test_v1_unflagged_batch_is_unchanged(layout):
     md = _v1_build(runner, len(kv_cache_groups))
     assert runner.batch_has_bidirectional is False
     assert all(md[name].causal is True for name in md)
+
+
+# ----------------------------------------------- windowed_attention_layer_names
+class _FakeLayer(AttentionLayerBase):
+    """An attention-like layer with the two things the helper reads."""
+
+    def __init__(self, spec, sliding_window=None):
+        self._spec = spec
+        self.sliding_window = sliding_window
+
+    def get_attn_backend(self):
+        return object
+
+    def get_kv_cache_spec(self, vllm_config):
+        return self._spec
+
+
+@pytest.mark.cpu_test
+def test_windowed_attention_layer_names_from_the_layers():
+    """Decided per layer from its own spec, never from a group: sliding, chunked-local
+    and promoted specs are windowed; a layer without a spec of its own (KV-shared,
+    encoder-only) is windowed when its module carries a sliding window; full, plain
+    encoder-only and Mamba layers are not."""
+    layers = {
+        "full.0": _FakeLayer(FULL),
+        "swa.0": _FakeLayer(SLIDING),
+        "chunk.0": _FakeLayer(CHUNKED),
+        "promoted.0": _FakeLayer(PROMOTED_SLIDING),
+        "shared_swa.0": _FakeLayer(None, sliding_window=128),
+        "enc.0": _FakeLayer(None),
+        "mamba.0": _FakeLayer(MAMBA),
+    }
+    vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context=layers)
+    )
+    assert windowed_attention_layer_names(vllm_config) == {
+        "swa.0",
+        "chunk.0",
+        "promoted.0",
+        "shared_swa.0",
+    }
+
+
+class CachingBuilder(RecordingBuilder):
+    """A builder whose builds are reused through update_block_table (as
+    FlashAttention's are)."""
+
+    supports_update_block_table = True
+
+    def update_block_table(self, cached, block_table, slot_mapping):
+        return cached
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("windowed_first", [False, True])
+def test_v1_metadata_cache_never_crosses_windowed_and_full_groups(windowed_first):
+    """Two attention groups of ONE merged spec and one builder type (layers split by
+    head count or backend): the V1 build cache, reused through update_block_table,
+    must not hand the full group's tensor build to the windowed group, nor the
+    reverse, whichever is built first."""
+    kv_cache_groups = [KVCacheGroupSpec(["full.0", "swa.0"], PROMOTED_SLIDING)]
+    full = AttentionGroup(
+        backend=object,
+        layer_names=["full.0"],
+        kv_cache_spec=PROMOTED_SLIDING,
+        kv_cache_group_id=0,
+        metadata_builders=[CachingBuilder()],
+    )
+    swa = AttentionGroup(
+        backend=object,
+        layer_names=["swa.0"],
+        kv_cache_spec=PROMOTED_SLIDING,
+        kv_cache_group_id=0,
+        metadata_builders=[CachingBuilder()],
+    )
+    attn_groups = [[swa, full] if windowed_first else [full, swa]]
+    runner = _v1_runner(kv_cache_groups, attn_groups, ("bidirectional", "causal"))
+    md = _v1_build(runner, 1)
+    assert torch.equal(md["full.0"].causal, runner.per_seq_causal_gpu[:2])
+    assert md["swa.0"].causal is True

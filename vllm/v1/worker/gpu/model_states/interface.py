@@ -102,7 +102,6 @@ class ModelState(ABC):
                 ),
             )
 
-
     @property
     def windowed_attention_layers(self) -> set[str]:
         """The attention layers that attend through a window of their own
@@ -115,6 +114,7 @@ class ModelState(ABC):
                 self.vllm_config
             )
         return self._windowed_attention_layers
+
     def get_supported_generation_tasks(self) -> tuple[GenerationTask, ...]:
         from vllm.model_executor.models.interfaces import (
             supports_realtime,
