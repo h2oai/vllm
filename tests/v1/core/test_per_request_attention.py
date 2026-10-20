@@ -197,3 +197,57 @@ def test_an_encoder_split_defers_and_a_never_fitting_encoder_input_errors():
     scheduler.update_from_output(out, model_output)
     out2 = scheduler.schedule()
     assert out2.num_scheduled_tokens.get("second") == 40  # whole, the budget free again
+
+
+def _run_until_scheduled(scheduler, req_id, max_steps):
+    """Steps the scheduler with a new 8-token causal request (8 output tokens)
+    arriving every step; every scheduled request samples one token per step.
+    Returns the step at which req_id was scheduled, or None."""
+    for step in range(max_steps):
+        if step > 0:
+            scheduler.add_request(_request(f"arrival-{step}", 8, None, max_tokens=8))
+        out = scheduler.schedule()
+        if req_id in out.num_scheduled_tokens:
+            return step
+        ids = list(out.num_scheduled_tokens)
+        scheduler.update_from_output(
+            out,
+            ModelRunnerOutput(
+                req_ids=ids,
+                req_id_to_index={r: i for i, r in enumerate(ids)},
+                sampled_token_ids=[[1000]] * len(ids),
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+    return None
+
+
+def test_a_deferred_bidirectional_prompt_ages_and_holds_admission(monkeypatch):
+    """A bidirectional prompt that fits one step (62 of 64 tokens) but not this
+    step's remaining budget is deferred. With a short causal request arriving
+    every step and decoding for 8 steps, the room never comes by itself: each
+    admitted request keeps a token of every later step's budget. After
+    BIDIRECTIONAL_MAX_DEFERRALS deferrals the scheduler admits nothing behind the
+    prompt, the running set drains, and the prompt is scheduled whole."""
+    from vllm.v1.core.sched import scheduler as sched_module
+
+    def fresh():
+        scheduler = create_scheduler(
+            max_num_batched_tokens=64, max_num_seqs=64, enable_chunked_prefill=True
+        )
+        for i in range(4):
+            scheduler.add_request(_request(f"first-{i}", 8, None, max_tokens=8))
+        scheduler.add_request(_request("two_way", 62, "bidirectional"))
+        return scheduler
+
+    # without aging (the behaviour before the fix) the prompt never runs
+    monkeypatch.setattr(sched_module, "BIDIRECTIONAL_MAX_DEFERRALS", 10**9)
+    assert _run_until_scheduled(fresh(), "two_way", 40) is None
+    monkeypatch.setattr(sched_module, "BIDIRECTIONAL_MAX_DEFERRALS", 8)
+    scheduler = fresh()
+    step = _run_until_scheduled(scheduler, "two_way", 40)
+    # 8 deferrals, then at most 8 steps for the running requests to finish
+    assert step is not None and step <= 8 + 8 + 1, step
+    assert scheduler.requests["two_way"].bidirectional_deferrals >= 8

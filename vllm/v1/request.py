@@ -248,6 +248,9 @@ class Request:
                     "bidirectional prefix"
                 )
             block_hasher = None  # no prefix-cache reads or writes for this request
+        # steps this request was deferred for lack of room (bounded aging in the
+        # scheduler)
+        self.bidirectional_deferrals = 0
 
         self.block_hashes: list[BlockHash] = []
         # Store the block hasher without binding self to avoid creating a
