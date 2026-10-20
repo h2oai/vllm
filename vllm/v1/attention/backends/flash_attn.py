@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashAttention."""
 
+import contextlib
 import copy
 import functools
 from dataclasses import dataclass
@@ -84,6 +85,42 @@ from vllm.v1.worker.cp_utils import (
 )
 
 logger = init_logger(__name__)
+
+_FA4_DYNAMIC_CAUSAL_CACHE = None
+
+
+def _fa4_dynamic_causal_cache():
+    """A separate FA4 forward JIT cache for calls that carry a per-sequence
+    causal tensor. The vendored kernel's compile key does not record whether
+    dynamic_causal is set, so a kernel compiled for a plain causal call (the
+    warm-up, any unflagged batch) would be reused for a dynamic-causal call
+    and fail on the argument type ("Mismatched type on argument #10 ...
+    mDynamicCausal: None"). Keeping the two kinds of calls in two caches keeps
+    every compiled kernel matched to its argument kinds."""
+    global _FA4_DYNAMIC_CAUSAL_CACHE
+    if _FA4_DYNAMIC_CAUSAL_CACHE is None:
+        from vllm.vllm_flash_attn.cute.cache_utils import get_jit_cache
+
+        _FA4_DYNAMIC_CAUSAL_CACHE = get_jit_cache("fwd_dynamic_causal")
+    return _FA4_DYNAMIC_CAUSAL_CACHE
+
+
+@contextlib.contextmanager
+def _fa4_cache_for(dynamic_causal):
+    """Run an FA4 forward with the dynamic-causal JIT cache when a per-sequence
+    causal tensor is passed, the regular one otherwise."""
+    if dynamic_causal is None:
+        yield
+        return
+    from vllm.vllm_flash_attn.cute import interface as fa4_interface
+
+    fwd = fa4_interface._flash_attn_fwd
+    saved = fwd.compile_cache
+    fwd.compile_cache = _fa4_dynamic_causal_cache()
+    try:
+        yield
+    finally:
+        fwd.compile_cache = saved
 
 FA4_DENSE_FLOAT_DTYPES = (torch.bfloat16, torch.float16)
 FA4_DENSE_Q_TILE = 128
@@ -1378,32 +1415,33 @@ class FlashAttentionImpl(AttentionImpl):
                     block_table = block_table[:, :num_pages]
                     num_splits = 1
 
-                _FA4_DENSE_ATTENTION_KERNEL(
-                    q=query[:num_actual_tokens],
-                    k=key_cache,
-                    v=value_cache,
-                    out=output[:num_actual_tokens],
-                    cu_seqlens_q=cu_seqlens_q,
-                    max_seqlen_q=max_seqlen_q,
-                    seqused_k=seqused_k,
-                    max_seqlen_k=max_seqlen_k,
-                    softmax_scale=self.scale,
-                    causal=causal,
-                    alibi_slopes=self.alibi_slopes,
-                    window_size=sliding_window_size,
-                    block_table=block_table,
-                    softcap=self.logits_soft_cap,
-                    scheduler_metadata=scheduler_metadata,
-                    fa_version=self.vllm_flash_attn_version,
-                    q_descale=q_descale,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                    dynamic_causal=dynamic_causal,
-                    num_splits=num_splits,
-                    s_aux=self.sinks,
-                    mask_mod=rswa_mask_mod_fn or mm_mask_mod,
-                    aux_tensors=rswa_aux or mm_aux,
-                )
+                with _fa4_cache_for(dynamic_causal):
+                    _FA4_DENSE_ATTENTION_KERNEL(
+                        q=query[:num_actual_tokens],
+                        k=key_cache,
+                        v=value_cache,
+                        out=output[:num_actual_tokens],
+                        cu_seqlens_q=cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        seqused_k=seqused_k,
+                        max_seqlen_k=max_seqlen_k,
+                        softmax_scale=self.scale,
+                        causal=causal,
+                        alibi_slopes=self.alibi_slopes,
+                        window_size=sliding_window_size,
+                        block_table=block_table,
+                        softcap=self.logits_soft_cap,
+                        scheduler_metadata=scheduler_metadata,
+                        fa_version=self.vllm_flash_attn_version,
+                        q_descale=q_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        dynamic_causal=dynamic_causal,
+                        num_splits=num_splits,
+                        s_aux=self.sinks,
+                        mask_mod=rswa_mask_mod_fn or mm_mask_mod,
+                        aux_tensors=rswa_aux or mm_aux,
+                    )
                 return output
 
         # Cascade attention (rare case).
