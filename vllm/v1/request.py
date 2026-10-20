@@ -59,10 +59,54 @@ def parse_attention_mode(sampling_params: SamplingParams | None) -> str:
     return mode
 
 
+def _declared_head_sizes(model_config: Any) -> list[int]:
+    """Every attention head size the model declares: the main one plus, where a
+    config gives some layers their own (a global_head_dim for the full-attention
+    layers, or per_layer_config entries with a head_dim, as Gemma-4 does), those
+    too; sorted, without duplicates."""
+    text_config = getattr(model_config, "hf_text_config", None)
+    sizes = {int(model_config.get_head_size())}
+    global_head_dim = getattr(text_config, "global_head_dim", None)
+    if global_head_dim:
+        sizes.add(int(global_head_dim))
+    per_layer = getattr(text_config, "per_layer_config", None)
+    if isinstance(per_layer, dict):
+        for entry in per_layer.values():
+            head_dim = entry.get("head_dim") if isinstance(entry, dict) else None
+            if head_dim:
+                sizes.add(int(head_dim))
+    return sorted(sizes)
+
+
+def _fa4_version_reason(model_config: Any, resolve: Any) -> str | None:
+    """Why a layer of this model would not run FlashAttention 4: ``resolve``
+    (get_flash_attn_version, evaluated under the engine's config) gives the
+    version the backend picks for a head size, with ALiBi and softcapping
+    taken into account; the first head size that does not resolve to 4 is the
+    reason, since such a layer would raise on the per-sequence flag."""
+    text_config = getattr(model_config, "hf_text_config", None)
+    requires_alibi = bool(getattr(model_config, "uses_alibi", False))
+    requires_softcap = bool(getattr(text_config, "attn_logit_softcapping", None))
+    for head_size in _declared_head_sizes(model_config):
+        version = resolve(
+            requires_alibi=requires_alibi,
+            head_size=head_size,
+            requires_softcap=requires_softcap,
+            supports_fa4_hd256=True,
+        )
+        if version != 4:
+            return (
+                f"FlashAttention {version or 'no version'} resolves for head size "
+                f"{head_size}"
+            )
+    return None
+
+
 def _fa4_platform_reason(vllm_config: Any) -> str | None:
-    """Why FlashAttention 4 cannot run on this engine, from the platform and from
-    the version the backend resolves for this model's head size; None when it
-    can. Tests replace this function."""
+    """Why FlashAttention 4 cannot serve the per-sequence flag on this engine:
+    the platform (CUDA only, not under VLLM_BATCH_INVARIANT) and the version the
+    backend resolves for every head size the model declares; None when it can.
+    Tests replace this function."""
     import vllm.envs as envs
     from vllm.platforms import current_platform
 
@@ -73,18 +117,8 @@ def _fa4_platform_reason(vllm_config: Any) -> str | None:
     from vllm.config import set_current_vllm_config
     from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 
-    model_config = vllm_config.model_config
-    text_config = getattr(model_config, "hf_text_config", None)
-    head_size = model_config.get_head_size()
     with set_current_vllm_config(vllm_config):
-        version = get_flash_attn_version(
-            head_size=head_size,
-            requires_softcap=bool(getattr(text_config, "attn_logit_softcapping", None)),
-            supports_fa4_hd256=True,
-        )
-    if version != 4:
-        return f"FlashAttention {version} resolves for head size {head_size}"
-    return None
+        return _fa4_version_reason(vllm_config.model_config, get_flash_attn_version)
 
 
 def flash_attn_per_sequence_support(vllm_config: Any) -> str | None:

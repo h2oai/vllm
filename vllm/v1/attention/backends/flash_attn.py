@@ -86,24 +86,21 @@ from vllm.v1.worker.cp_utils import (
 
 logger = init_logger(__name__)
 
-_FA4_DYNAMIC_CAUSAL_CACHE = None
 
-
+@functools.cache
 def _fa4_dynamic_causal_cache() -> Any:
     """A separate FA4 forward JIT cache for calls that carry a per-sequence
-    causal tensor. The vendored kernel's compile key does not record whether
-    dynamic_causal is set, so a kernel compiled for a plain causal call (the
-    warm-up, any unflagged batch) would be reused for a dynamic-causal call
-    and fail on the argument type ("Mismatched type on argument #10 ...
-    mDynamicCausal: None"). Keeping the two kinds of calls in two caches keeps
-    every compiled kernel matched to its argument kinds. The proper fix is to
-    record the flag in the vendored compile key; this swap goes once it does."""
-    global _FA4_DYNAMIC_CAUSAL_CACHE
-    if _FA4_DYNAMIC_CAUSAL_CACHE is None:
-        from vllm.vllm_flash_attn.cute.cache_utils import get_jit_cache
+    causal tensor, looked up once. The vendored kernel's compile key does not
+    record whether dynamic_causal is set, so a kernel compiled for a plain
+    causal call (the warm-up, any unflagged batch) would be reused for a
+    dynamic-causal call and fail on the argument type ("Mismatched type on
+    argument #10 ... mDynamicCausal: None"). Keeping the two kinds of calls in
+    two caches keeps every compiled kernel matched to its argument kinds. The
+    proper fix is to record the flag in the vendored compile key; this swap
+    goes once it does."""
+    from vllm.vllm_flash_attn.cute.cache_utils import get_jit_cache
 
-        _FA4_DYNAMIC_CAUSAL_CACHE = get_jit_cache("fwd_dynamic_causal")
-    return _FA4_DYNAMIC_CAUSAL_CACHE
+    return get_jit_cache("fwd_dynamic_causal")
 
 
 @contextlib.contextmanager

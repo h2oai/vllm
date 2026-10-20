@@ -394,10 +394,11 @@ def test_the_fa4_dynamic_causal_cache_swap(monkeypatch):
         "vllm.vllm_flash_attn.cute.cache_utils",
         SimpleNamespace(get_jit_cache=lambda name: dynamic),
     )
-    monkeypatch.setattr(fa, "_FA4_DYNAMIC_CAUSAL_CACHE", None)
+    fa._fa4_dynamic_causal_cache.cache_clear()
     with fa._fa4_cache_for(None):
         assert fwd.compile_cache is regular
-    assert fa._FA4_DYNAMIC_CAUSAL_CACHE is None  # nothing looked up without a tensor
+    # nothing looked up without a tensor
+    assert fa._fa4_dynamic_causal_cache.cache_info().currsize == 0
     tensor = SimpleNamespace()  # stands in for the int32 flag tensor
     with fa._fa4_cache_for(tensor):
         assert fwd.compile_cache is dynamic
@@ -409,6 +410,61 @@ def test_the_fa4_dynamic_causal_cache_swap(monkeypatch):
         with fa._fa4_cache_for(tensor):
             raise RuntimeError("compile failed")
     assert fwd.compile_cache is regular
+    fa._fa4_dynamic_causal_cache.cache_clear()
+
+
+def test_the_guard_resolves_the_version_for_every_declared_head_size():
+    """The FLASH_ATTN check resolves the FlashAttention version for every head
+    size the model declares (the main one, a global_head_dim, per_layer_config
+    entries), with ALiBi and softcapping passed on, and names the first head
+    size that does not resolve to 4: a layer on FlashAttention 2 or 3 would
+    raise on the per-sequence flag, so the request is refused up front."""
+    from vllm.v1.request import _declared_head_sizes, _fa4_version_reason
+
+    def model(head, text=None, alibi=False):
+        return SimpleNamespace(
+            get_head_size=lambda: head,
+            hf_text_config=SimpleNamespace(**(text or {})),
+            uses_alibi=alibi,
+        )
+
+    assert _declared_head_sizes(model(128)) == [128]
+    assert _declared_head_sizes(model(256, {"global_head_dim": 512})) == [256, 512]
+    gemma_style = {
+        "per_layer_config": {"05": {"head_dim": 512, "num_key_value_heads": 4}},
+        "attn_logit_softcapping": None,
+    }
+    assert _declared_head_sizes(model(256, gemma_style)) == [256, 512]
+    assert _declared_head_sizes(model(256, {"per_layer_config": "x"})) == [256]
+
+    seen = []
+
+    def resolve(**kw):  # FlashAttention 4 up to head 256, 2 above (Blackwell)
+        seen.append(kw)
+        return 4 if kw["head_size"] <= 256 else 2
+
+    assert _fa4_version_reason(model(128), resolve) is None
+    assert seen[-1] == {
+        "requires_alibi": False,
+        "head_size": 128,
+        "requires_softcap": False,
+        "supports_fa4_hd256": True,
+    }
+    assert _fa4_version_reason(model(256, gemma_style), resolve) == (
+        "FlashAttention 2 resolves for head size 512"
+    )
+    assert _fa4_version_reason(model(256, {"global_head_dim": 512}), resolve) == (
+        "FlashAttention 2 resolves for head size 512"
+    )
+    # ALiBi and softcapping reach the resolver
+    _fa4_version_reason(
+        model(128, {"attn_logit_softcapping": 30.0}, alibi=True), resolve
+    )
+    assert seen[-1]["requires_alibi"] is True and seen[-1]["requires_softcap"] is True
+    # no version at all (an unsupported GPU for the forced version): named too
+    assert _fa4_version_reason(model(128), lambda **kw: None) == (
+        "FlashAttention no version resolves for head size 128"
+    )
 
 
 def test_the_frontend_checks_bidirectional_requests_only(monkeypatch):
