@@ -1184,6 +1184,28 @@ class Scheduler(SchedulerInterface):
                         if request.has_encoder_inputs:
                             self.encoder_cache_manager.free(request)
                         request_queue.pop_request()
+                        # a prompt whose encoder inputs exceed what ANY step can
+                        # encode (the static encoder budget, the encoder cache)
+                        # can never fit: finished with an error, not deferred
+                        encoder_tokens = sum(
+                            request.get_num_encoder_embeds(i)
+                            for i in range(len(request.mm_features))
+                        )
+                        encoder_cap = min(
+                            self.max_num_encoder_input_tokens,
+                            self.encoder_cache_manager.cache_size,
+                        )
+                        if encoder_tokens > encoder_cap:
+                            logger.warning(
+                                "bidirectional request %s: its encoder inputs (%d "
+                                "tokens) exceed what one step can encode (%d); a "
+                                "bidirectional prompt is prefilled in one step",
+                                request.request_id,
+                                encoder_tokens,
+                                encoder_cap,
+                            )
+                            self.bidirectional_error_reqs.add(request.request_id)
+                            continue
                         step_skipped_waiting.prepend_request(request)
                         continue
 
