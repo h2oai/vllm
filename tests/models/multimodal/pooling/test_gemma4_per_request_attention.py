@@ -243,6 +243,10 @@ def _one_engine_label_probs(vllm_runner, prompts, label_ids):
         MODEL,
         attention_backend=BACKEND,
         disable_log_stats=False,  # LLM.get_metrics() for the step count below
+        # a hybrid checkpoint (Mamba / gated-delta layers) with prefix caching
+        # needs chunked prefill on; a bidirectional prompt is still prefilled
+        # whole (whole-or-defer in the scheduler)
+        enable_chunked_prefill=True,
         **ENGINE_EXTRA,
         max_model_len=MAX_LEN,
         max_num_batched_tokens=MAX_LEN,
