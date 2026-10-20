@@ -107,7 +107,8 @@ PROMPTS = [
 # reference's answer, and on every row where the two references give different clear
 # answers the flagged read returns the two-way answer and the unflagged read the
 # causal one (at least one such row must exist) -- and the gaps stay under absolute
-# caps, a loose sanity bound rather than a regression bound.
+# caps (the row-wise cap on the clear rows, the mean over every row), a loose sanity
+# bound rather than a regression bound.
 # Run this test in bf16. Under FP8 the pooling reference itself is not reproducible:
 # on the 31B checkpoint the causal reference moved by up to 0.8 on one row between
 # two runs on the same GPU (the one-engine reads were identical in both), so the FP8
@@ -310,14 +311,18 @@ def test_flagged_read_is_the_two_way_pooling_read_and_unflagged_the_causal_one(
             two_way[r],
             ref_two_way[r],
         )
-    # 3. the numeric gaps stay under the absolute caps: a loose sanity bound (the
-    # pooling reference itself moves between runs), not the decision, which is
-    # checks 1 and 2
-    assert d_one.max().item() <= max_dp and d_one.mean().item() <= mean_dp, (
-        one_way,
-        ref_one_way,
-    )
-    assert d_two.max().item() <= max_dp and d_two.mean().item() <= mean_dp, (
-        two_way,
-        ref_two_way,
-    )
+    # 3. the numeric gaps stay under the absolute caps: a loose sanity bound, not
+    # the decision, which is checks 1 and 2. The row-wise cap is judged on the
+    # clear rows only: on a near-tie row the pooling reference itself can land on
+    # another answer in another run (measured in bf16 on the larger checkpoint:
+    # the two-way reference of one near-tie row moved from 0.48 to 0.52 on a
+    # different option, a 0.47 gap, with the engine's reads identical in both
+    # runs), so a gap there measures the reference, not the engine. The mean is
+    # over every row.
+    for ours, ref, gap in (
+        (one_way, ref_one_way, d_one),
+        (two_way, ref_two_way, d_two),
+    ):
+        clear = clear_rows(ref)
+        assert gap[clear].max().item() <= max_dp, (clear, gap, ours, ref)
+        assert gap.mean().item() <= mean_dp, (gap, ours, ref)
