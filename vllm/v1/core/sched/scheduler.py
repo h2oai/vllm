@@ -1184,8 +1184,15 @@ class Scheduler(SchedulerInterface):
                         # The encoder budget (or the prefill lookahead) would
                         # split a bidirectional prompt: wait for a step that
                         # holds it whole, instead of a partial prefill. Nothing
-                        # has been allocated for it (the encoder inputs are only
-                        # committed below), so nothing is freed here.
+                        # was allocated for it (the encoder inputs are only
+                        # committed below), but the cache check above added
+                        # this request's references to its cached items: they
+                        # are released (the plain manager only drops references
+                        # it holds; the encoder-decoder manager credits slots
+                        # instead and is skipped), and no admission hold applies
+                        # here. A held queue could keep the requests that share
+                        # those items from running, and the item this request
+                        # needs would then never become free.
                         request_queue.pop_request()
                         # a prompt whose encoder inputs exceed what ANY step can
                         # encode (the static encoder budget, the encoder cache)
@@ -1209,8 +1216,9 @@ class Scheduler(SchedulerInterface):
                             )
                             self.bidirectional_error_reqs.add(request.request_id)
                             continue
-                        if self._defer_bidirectional(request, step_skipped_waiting):
-                            break
+                        if request.has_encoder_inputs and not self.is_encoder_decoder:
+                            self.encoder_cache_manager.free(request)
+                        step_skipped_waiting.prepend_request(request)
                         continue
 
                     if num_new_tokens == 0:
@@ -2412,15 +2420,18 @@ class Scheduler(SchedulerInterface):
     def _defer_bidirectional(
         self, request: Request, step_skipped_waiting: RequestQueue
     ) -> bool:
-        """Put a bidirectional request that does not fit this step back for a
-        later one. Returns True when nothing further should be admitted from
-        the waiting queues this step: after BIDIRECTIONAL_MAX_DEFERRALS the
-        request has aged out. Running requests are scheduled first and the
-        smaller prompts behind a deferred one would otherwise be admitted every
-        step and keep a share of every later step's budget while they decode,
-        so a prompt close to the step cap could wait for as long as traffic
-        continues; with admission held the running set drains and a later step
-        has the room."""
+        """Put a bidirectional request that does not fit this step's token
+        budget back for a later one. Returns True when nothing further should
+        be admitted from the waiting queues this step: after
+        BIDIRECTIONAL_MAX_DEFERRALS the request has aged out. Running requests
+        are scheduled first and the smaller prompts behind a deferred one would
+        otherwise be admitted every step and keep a share of every later step's
+        budget while they decode, so a prompt close to the step cap could wait
+        for as long as traffic continues; with admission held the running set
+        drains and a later step has the room. Only the token-budget deferral
+        holds admission: an encoder-split deferral never does, since the
+        requests behind it may hold the encoder-cache references whose release
+        it is waiting for."""
         step_skipped_waiting.prepend_request(request)
         request.bidirectional_deferrals += 1
         return request.bidirectional_deferrals > BIDIRECTIONAL_MAX_DEFERRALS
