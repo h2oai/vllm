@@ -180,15 +180,15 @@ def test_an_encoder_split_defers_and_a_never_fitting_encoder_input_errors():
     never = _mm_request("never", 100, 4, 80, "bidirectional")  # 80 > any step's 64
     for request in (first, second, never):
         scheduler.add_request(request)
-    # a deferral frees nothing: no encoder input of the deferred request was
-    # allocated (an encoder-decoder cache manager would credit slots that were never
-    # taken)
+    # the deferral releases only the deferred request's own references (the plain
+    # manager's free drops just those; nothing was allocated for it), and nothing
+    # of any other request
     freed = []
     real_free = scheduler.encoder_cache_manager.free
     scheduler.encoder_cache_manager.free = lambda req: freed.append(req.request_id)
     out = scheduler.schedule()
     scheduler.encoder_cache_manager.free = real_free
-    assert freed == []
+    assert freed == ["second"]
     assert out.num_scheduled_tokens.get("first") == 48
     assert "second" not in out.num_scheduled_tokens
     assert "never" in scheduler.bidirectional_error_reqs
@@ -259,11 +259,18 @@ def test_a_deferred_bidirectional_prompt_ages_and_holds_admission(monkeypatch):
     assert scheduler.requests["two_way"].bidirectional_deferrals >= 8
 
 
-def _config(backend_name, kv_connector):
+def _config(backend_name, kv_connector, per_kind=None):
     backend = SimpleNamespace(name=backend_name) if backend_name else None
     return SimpleNamespace(
-        attention_config=SimpleNamespace(backend=backend),
+        attention_config=SimpleNamespace(
+            backend=backend,
+            backend_per_kind={
+                kind: SimpleNamespace(name=name)
+                for kind, name in (per_kind or {}).items()
+            },
+        ),
         kv_transfer_config=SimpleNamespace() if kv_connector else None,
+        reasoning_config=None,
     )
 
 
@@ -291,3 +298,155 @@ def test_a_bidirectional_request_is_refused_where_it_cannot_be_served():
     decoding = SamplingParams(max_tokens=4, extra_args={"attention_mode": "two-way"})
     with pytest.raises(ValueError, match="max_tokens=1"):
         check_bidirectional_request(decoding, _config("TRITON_ATTN", False))
+    # a per-kind override that routes any attention kind elsewhere is refused too
+    with pytest.raises(ValueError, match="backend_per_kind"):
+        check_bidirectional_request(
+            two_way, _config("TRITON_ATTN", False, {"full_attention": "FLASH_ATTN"})
+        )
+    check_bidirectional_request(
+        two_way, _config("TRITON_ATTN", False, {"full_attention": "TRITON_ATTN"})
+    )
+
+
+def test_the_frontend_checks_bidirectional_requests_only(monkeypatch):
+    """InputProcessor._validate_params refuses a bidirectional request with a
+    VLLMValidationError naming attention_mode, and never checks a causal one."""
+    from vllm.exceptions import VLLMValidationError
+    from vllm.v1.engine.input_processor import InputProcessor
+
+    monkeypatch.setattr(SamplingParams, "verify", lambda self, *args, **kwargs: None)
+
+    def processor(config):
+        return SimpleNamespace(
+            vllm_config=config,
+            model_config=SimpleNamespace(
+                return_sampling_mask=False, enable_trace_replay=False
+            ),
+            speculative_config=None,
+            structured_outputs_config=None,
+            tokenizer=None,
+        )
+
+    validate = InputProcessor._validate_params
+    causal = SamplingParams(max_tokens=4)
+    two_way = SamplingParams(max_tokens=1, extra_args={"attention_mode": "two-way"})
+    validate(processor(_config(None, False)), causal, ("generate",))
+    validate(processor(_config("TRITON_ATTN", False)), two_way, ("generate",))
+    with pytest.raises(VLLMValidationError, match="TRITON_ATTN") as info:
+        validate(processor(_config("FLASH_ATTN", False)), two_way, ("generate",))
+    assert info.value.parameter == "attention_mode"
+
+
+def _mm_request_images(req_id, num_tokens, images, mode, max_tokens=1):
+    """A request with several images, each (identifier, offset, length); requests
+    that share an identifier share the cached encoder output."""
+    init_none_hash(sha256)
+    extra = {"attention_mode": mode} if mode is not None else None
+    sp = SamplingParams(max_tokens=max_tokens, extra_args=extra)
+    sp.update_from_generation_config({}, EOS_TOKEN_ID)
+    features = [
+        MultiModalFeatureSpec(
+            data=MultiModalKwargsItem.dummy(),
+            mm_position=PlaceholderRange(offset=offset, length=length),
+            identifier=identifier,
+            modality="image",
+        )
+        for identifier, offset, length in images
+    ]
+    return Request(
+        request_id=req_id,
+        prompt_token_ids=list(range(num_tokens)),
+        sampling_params=sp,
+        pooling_params=None,
+        mm_features=features,
+        block_hasher=get_request_block_hasher(16, sha256),
+    )
+
+
+def _step(scheduler, out):
+    """One model step: every scheduled request samples one token."""
+    ids = list(out.num_scheduled_tokens)
+    scheduler.update_from_output(
+        out,
+        ModelRunnerOutput(
+            req_ids=ids,
+            req_id_to_index={r: i for i, r in enumerate(ids)},
+            sampled_token_ids=[[1000]] * len(ids),
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+
+def test_deferred_two_way_reads_release_their_encoder_references():
+    """Two two-way reads share cached images (a: 36 slots, b: 16, of 56) and each
+    needs a new 12-slot image. In the step where b is encoded for a causal request,
+    neither new image fits beside the two cached ones, and both reads are deferred
+    at the encoder split. Before the fix each kept its reference to its cached
+    image, so neither image could ever be evicted for the other's new one: both
+    waited for good. Now a deferral releases the request's own references: read_b
+    evicts the released image a for its new one in that same step, and read_a
+    follows a step later."""
+    scheduler = create_scheduler(
+        max_num_batched_tokens=256, max_num_seqs=8, enable_chunked_prefill=True
+    )
+    scheduler.max_num_encoder_input_tokens = 64
+    scheduler.encoder_cache_manager = EncoderCacheManager(cache_size=56)
+    scheduler.add_request(_mm_request_images("once_a", 40, [("image-a", 0, 36)], None))
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens.get("once_a") == 40
+    _step(scheduler, out)  # image a cached, unreferenced; 20 slots free
+    scheduler.add_request(_mm_request_images("once_b", 20, [("image-b", 0, 16)], None))
+    scheduler.add_request(
+        _mm_request_images(
+            "read_a", 56, [("image-a", 0, 36), ("image-e1", 40, 12)], "bidirectional"
+        )
+    )
+    scheduler.add_request(
+        _mm_request_images(
+            "read_b", 36, [("image-b", 0, 16), ("image-e2", 20, 12)], "bidirectional"
+        )
+    )
+    scheduled = {}
+    for step in range(6):
+        out = scheduler.schedule()
+        for req_id in ("read_a", "read_b"):
+            if req_id in out.num_scheduled_tokens:
+                scheduled.setdefault(req_id, step)
+        _step(scheduler, out)
+    assert not scheduler.bidirectional_error_reqs
+    assert scheduled == {"read_b": 0, "read_a": 1}, scheduled  # before the fix: {}
+
+
+def test_an_encoder_split_deferral_holds_no_admission():
+    """A two-way read whose new 40-slot image cannot be allocated while a queued
+    request keeps a reference to the cached image a (40 of 64 slots) is deferred
+    at the encoder split every step. Before the fix, after eight deferrals it held
+    admission, and a plain causal request behind it never ran. Now only the
+    token-budget deferral holds admission: the causal request runs at once, and
+    the read runs as soon as the reference goes."""
+    scheduler = create_scheduler(
+        max_num_batched_tokens=256, max_num_seqs=8, enable_chunked_prefill=True
+    )
+    scheduler.max_num_encoder_input_tokens = 64
+    scheduler.encoder_cache_manager = EncoderCacheManager(cache_size=64)
+    scheduler.add_request(_mm_request_images("once", 48, [("image-a", 0, 40)], None))
+    _step(scheduler, scheduler.schedule())  # image a cached, unreferenced
+    # a queued request that referenced image a in an earlier step and has not run
+    holder = _mm_request_images("holder", 48, [("image-a", 0, 40)], None)
+    assert scheduler.encoder_cache_manager.check_and_update_cache(holder, 0)
+    scheduler.add_request(
+        _mm_request_images("read", 48, [("image-w", 4, 40)], "bidirectional")
+    )
+    for _ in range(10):
+        out = scheduler.schedule()
+        assert "read" not in out.num_scheduled_tokens  # 24 free, nothing evictable
+        _step(scheduler, out)
+    scheduler.add_request(_request("plain", 32, None, max_tokens=2))
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens.get("plain") == 32  # before the fix: never
+    _step(scheduler, out)
+    scheduler.encoder_cache_manager.free_encoder_input(holder, 0)  # the holder ran
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens.get("read") == 48
