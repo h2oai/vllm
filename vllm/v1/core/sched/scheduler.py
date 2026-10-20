@@ -251,6 +251,10 @@ class Scheduler(SchedulerInterface):
         # update_from_output.
         self.grammar_compile_error_reqs: set[str] = set()
         self.encoder_cache_mismatch_reqs: set[str] = set()
+        # H2O per-request attention: bidirectional requests whose prompt can never fit one
+        # prefill step, finished with an error in update_from_output (like a grammar
+        # compile error) so the client receives finish_reason "error".
+        self.bidirectional_error_reqs: set[str] = set()
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -1189,8 +1193,10 @@ class Scheduler(SchedulerInterface):
                                 self.max_num_scheduled_tokens,
                             )
                             request_queue.pop_request()
-                            request.status = RequestStatus.FINISHED_ERROR
-                            self._free_request(request)
+                            # finished in update_from_output, which emits the
+                            # output with finish_reason "error" (freeing it here
+                            # left the client without any output: it hung)
+                            self.bidirectional_error_reqs.add(request.request_id)
                             continue
                         request_queue.pop_request()
                         step_skipped_waiting.prepend_request(request)
@@ -2341,6 +2347,9 @@ class Scheduler(SchedulerInterface):
         self.grammar_compile_error_reqs.clear()
         error_req_ids.update(self.encoder_cache_mismatch_reqs)
         self.encoder_cache_mismatch_reqs.clear()
+        # H2O per-request attention: bidirectional prompts over the one-step window
+        error_req_ids.update(self.bidirectional_error_reqs)
+        self.bidirectional_error_reqs.clear()
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             error_req_ids.update(failed_kv_load_req_ids)
         if self.ec_connector is not None:
