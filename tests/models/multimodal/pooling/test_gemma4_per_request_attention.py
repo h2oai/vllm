@@ -303,17 +303,23 @@ def _one_engine_label_probs(vllm_runner, prompts, label_ids):
     return probs[0::2], probs[1::2]
 
 
+def test_flagged_read_is_the_two_way_pooling_read_and_unflagged_the_causal_one(
+    vllm_runner,
+):
+    # the accessibility skip stays in this process: inside the spawned child
+    # below a skip would be reported as a pass
+    if not _model_accessible():  # at run time, not at collection: a network call
+        pytest.skip(f"model {MODEL} is not accessible here")
+    _flagged_read_test(vllm_runner)
+
+
 # a fresh interpreter (spawned, not forked: the in-process engine core below
 # initialises CUDA in this process, which a fork of a CUDA-touched parent may
 # not do): the engine core freezes the environment cache and keeps its GPU
 # memory, neither of which must reach other tests, and the environment
 # settings below are made directly on this throwaway process
 @create_new_process_for_each_test("spawn")
-def test_flagged_read_is_the_two_way_pooling_read_and_unflagged_the_causal_one(
-    vllm_runner,
-):
-    if not _model_accessible():  # at run time, not at collection: a network call
-        pytest.skip(f"model {MODEL} is not accessible here")
+def _flagged_read_test(vllm_runner):
     # this process has touched CUDA (the GPU checks at import), so the engine
     # processes of the references below must be spawned, never forked
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"

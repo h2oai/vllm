@@ -269,6 +269,8 @@ def _config(
     mm_prefix=False,
     bidirectional="none",
     v_head_dim=None,
+    v_channels=None,
+    sinks=0,
 ):
     backend = SimpleNamespace(name=backend_name) if backend_name else None
     return SimpleNamespace(
@@ -286,7 +288,10 @@ def _config(
             is_mm_prefix_lm=mm_prefix,
             get_head_size=lambda: 128,
             hf_text_config=SimpleNamespace(
-                use_bidirectional_attention=bidirectional, v_head_dim=v_head_dim
+                use_bidirectional_attention=bidirectional,
+                v_head_dim=v_head_dim,
+                v_channels=v_channels,
+                param_sink_number=sinks,
             ),
         ),
         kv_transfer_config=SimpleNamespace() if kv_connector else None,
@@ -330,7 +335,14 @@ def test_a_bidirectional_request_is_refused_where_it_cannot_be_served(monkeypatc
         check_bidirectional_request(
             two_way, _config("TRITON_ATTN", False, v_head_dim=64)
         )
+    with pytest.raises(ValueError, match="value head size"):
+        check_bidirectional_request(
+            two_way, _config("TRITON_ATTN", False, v_channels=64)
+        )
+    with pytest.raises(ValueError, match="attention sinks"):
+        check_bidirectional_request(two_way, _config("TRITON_ATTN", False, sinks=2))
     check_bidirectional_request(two_way, _config("TRITON_ATTN", False, v_head_dim=128))
+    check_bidirectional_request(two_way, _config("TRITON_ATTN", False, v_channels=128))
     # a per-kind override that routes any attention kind elsewhere is refused too
     with pytest.raises(ValueError, match="backend_per_kind"):
         check_bidirectional_request(
