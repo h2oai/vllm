@@ -1257,9 +1257,26 @@ class Gemma4Model(nn.Module, EagleModelMixin):
             # Allocate static buffers for CUDAGraph
             max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
             device = next(self.parameters()).device
+            # (the positions buffer also feeds the self-decoder: a whole step)
             self.positions = torch.zeros(
                 max_num_tokens, dtype=torch.int64, device=device
             )
+            # H2O: the cross-decoder's hidden and per-layer inputs (the logits
+            # rows) need fixed addresses only for its cudagraph sizes; a larger
+            # reduced batch (more logits rows than the largest capture size, or
+            # the whole batch when fast prefill is not armed) is gathered into
+            # fresh tensors. So these buffers hold the largest capture size or
+            # the most logits rows of a step, not a whole step: at a
+            # 131072-token step the E4B's per-layer-input buffer alone took
+            # 2.8 GB.
+            spec = vllm_config.speculative_config
+            max_logits_rows = vllm_config.scheduler_config.max_num_seqs * (
+                1 + ((spec.num_speculative_tokens or 0) if spec is not None else 0)
+            )
+            max_capture = (
+                vllm_config.compilation_config.max_cudagraph_capture_size or 0
+            )
+            max_num_tokens = min(max_num_tokens, max(max_logits_rows, max_capture))
             self.hidden_states = torch.zeros(
                 (max_num_tokens, config.hidden_size),
                 dtype=vllm_config.model_config.dtype,
@@ -1383,13 +1400,23 @@ class Gemma4Model(nn.Module, EagleModelMixin):
         hidden_states = self_decoder_hidden_states.clone()
 
         num_padded = logits_indices_padded.size(0)
-        self.positions[:num_padded].copy_(positions[logits_indices_padded])
-        self.hidden_states[:num_padded].copy_(
-            self_decoder_hidden_states[logits_indices_padded]
-        )
-        if self.per_layer_inputs is not None and per_layer_inputs is not None:
-            self.per_layer_inputs[:num_padded].copy_(
+        if num_padded <= self.hidden_states.size(0):
+            cross_positions = self.positions[:num_padded]
+            cross_positions.copy_(positions[logits_indices_padded])
+            cross_hidden = self.hidden_states[:num_padded]
+            cross_hidden.copy_(self_decoder_hidden_states[logits_indices_padded])
+            cross_per_layer = None
+            if self.per_layer_inputs is not None and per_layer_inputs is not None:
+                cross_per_layer = self.per_layer_inputs[:num_padded]
+                cross_per_layer.copy_(per_layer_inputs[logits_indices_padded])
+        else:
+            # beyond every cudagraph size (see the buffers in __init__)
+            cross_positions = positions[logits_indices_padded]
+            cross_hidden = self_decoder_hidden_states[logits_indices_padded]
+            cross_per_layer = (
                 per_layer_inputs[logits_indices_padded]
+                if self.per_layer_inputs is not None and per_layer_inputs is not None
+                else None
             )
 
         # Update batch_descriptor so the cross-decoder's piecewise
@@ -1401,14 +1428,9 @@ class Gemma4Model(nn.Module, EagleModelMixin):
                 orig_batch_desc, num_tokens=num_padded
             )
 
-        cross_per_layer = (
-            self.per_layer_inputs[:num_padded]
-            if self.per_layer_inputs is not None
-            else None
-        )
         cross_hidden_states = self.cross_decoder(
-            self.positions[:num_padded],
-            self.hidden_states[:num_padded],
+            cross_positions,
+            cross_hidden,
             cross_per_layer,
             **kwargs,
         )
