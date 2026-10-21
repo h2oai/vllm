@@ -77,8 +77,11 @@ WORDS = [
     "policy",
 ]
 # bf16 bound on the label probabilities of one read, fast prefill against the
-# full forward (the same kernels; only the upper layers' row count differs)
-MAX_ABS_DP = 0.02
+# full forward (the same kernels; only the upper layers' row count differs).
+# Measured on an E4B fine-tune (A6000, TRITON_ATTN): max 0.008 two-way, 0.017
+# one-way over these prompts; the step-to-step noise of the same engine reaches
+# that size on near ties, so the bound is the bf16 one (0.05), not the measured gap.
+MAX_ABS_DP = 0.05
 
 
 def _model_accessible() -> bool:
