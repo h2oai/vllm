@@ -311,6 +311,9 @@ def test_flagged_read_is_the_two_way_pooling_read_and_unflagged_the_causal_one(
 ):
     if not _model_accessible():  # at run time, not at collection: a network call
         pytest.skip(f"model {MODEL} is not accessible here")
+    # this test process is a fork of one that has touched CUDA (the GPU checks
+    # at import), so the engine processes below must be spawned, never forked
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(MODEL)
