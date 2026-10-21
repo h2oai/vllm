@@ -33,7 +33,8 @@ from vllm.v1.attention.backends.utils import (
     create_fast_prefill_custom_backend,
     make_kv_sharing_fast_prefill_common_attn_metadata,
 )
-from vllm.v1.kv_cache_interface import KVCacheGroupSpec
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+from vllm.v1.worker.gpu.attn_utils import FastPrefillBatchMetadata, build_attn_metadata
 from vllm.v1.worker.utils import AttentionGroup
 
 
@@ -186,6 +187,52 @@ def test_v1_runner_kv_shared_layers_get_the_flag_on_the_logits_rows(modes):
         assert md["full.0"].causal is True
     assert md["swa.0"].causal is True
     assert md["swa.1"].causal is True
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("flagged", [True, False])
+def test_v2_runner_kv_shared_layers_get_the_flag_on_the_logits_rows(flagged):
+    """The same for the V2 runner (vllm/v1/worker/gpu), which serves Gemma-4 by
+    default: build_attn_metadata with the step's fast-prefill rows."""
+    kv_cache_groups = [
+        KVCacheGroupSpec(["full.0", "full.1"], FULL),
+        KVCacheGroupSpec(["swa.0", "swa.1"], SLIDING),
+    ]
+    attn_groups = [
+        [_fp_group(FULL, ["full.0", "full.1"], 0)],
+        [_fp_group(SLIDING, ["swa.0", "swa.1"], 1)],
+    ]
+    flags = torch.tensor([0, 1], dtype=torch.int32) if flagged else True
+    qsl = torch.tensor([0, 4, 8], dtype=torch.int32)
+    md = build_attn_metadata(
+        attn_groups=attn_groups,
+        num_reqs=2,
+        num_tokens=8,
+        query_start_loc_gpu=qsl,
+        query_start_loc_cpu=qsl,
+        max_query_len=4,
+        seq_lens=torch.tensor([4, 4], dtype=torch.int32),
+        max_seq_len=4,
+        block_tables=[torch.zeros(2, 1, dtype=torch.int32) for _ in range(2)],
+        slot_mappings=torch.zeros(2, 8, dtype=torch.int64),
+        kv_cache_config=KVCacheConfig(
+            num_blocks=4, kv_cache_tensors=[], kv_cache_groups=kv_cache_groups
+        ),
+        causal=flags,
+        windowed_layers={"swa.0", "swa.1"},
+        fast_prefill=FastPrefillBatchMetadata(
+            logits_indices_padded=torch.tensor([3, 7], dtype=torch.int32),
+            num_logits_indices=2,
+            max_logits_per_req=1,
+        ),
+    )
+    for name in ("full.0", "full.1", "swa.0", "swa.1"):
+        assert md[name].num_actual_tokens == 2, name
+    if flagged:
+        assert md["full.0"].causal is flags
+    else:
+        assert md["full.0"].causal is True
+    assert md["swa.0"].causal is True
 
 
 class _ArchConfig(list):
