@@ -60,22 +60,18 @@ def parse_attention_mode(sampling_params: SamplingParams | None) -> str:
 
 
 def _declared_head_sizes(model_config: Any) -> list[int]:
-    """Every attention head size the model declares: the main one plus, where a
-    config gives some layers their own (a global_head_dim for the full-attention
-    layers, or per_layer_config entries with a head_dim, as Gemma-4 does), those
-    too; sorted, without duplicates."""
-    text_config = getattr(model_config, "hf_text_config", None)
-    sizes = {int(model_config.get_head_size())}
-    global_head_dim = getattr(text_config, "global_head_dim", None)
-    if global_head_dim:
-        sizes.add(int(global_head_dim))
-    per_layer = getattr(text_config, "per_layer_config", None)
-    if isinstance(per_layer, dict):
-        for entry in per_layer.values():
-            head_dim = entry.get("head_dim") if isinstance(entry, dict) else None
-            if head_dim:
-                sizes.add(int(head_dim))
-    return sorted(sizes)
+    """Every attention head size the model declares, from its architecture
+    config: the whole-model head size, or each layer's own where layers differ
+    (Gemma-4: 256 on the sliding layers, 512 on the full-attention layers);
+    sorted, without duplicates."""
+    arch = getattr(model_config, "model_arch_config", None)
+    if arch is None:
+        return [int(model_config.get_head_size())]
+    if getattr(arch, "per_layer_overrides", None):
+        return sorted(
+            {int(arch[i].head_size) for i in range(arch.total_num_hidden_layers)}
+        )
+    return [int(arch.head_size)]
 
 
 def _fa4_version_reason(model_config: Any, resolve: Any) -> str | None:
@@ -102,18 +98,35 @@ def _fa4_version_reason(model_config: Any, resolve: Any) -> str | None:
     return None
 
 
+def _fa4_device_reason(platform: Any, batch_invariant: bool) -> str | None:
+    """Why this device cannot run FlashAttention 4's per-sequence causal flag:
+    CUDA only, not under VLLM_BATCH_INVARIANT (which selects version 2), and
+    Hopper only: the vendored kernel applies dynamic_causal on compute
+    capability 9.x alone (the Blackwell kernels accept the argument and ignore
+    it); None when it can."""
+    if not platform.is_cuda():
+        return "FlashAttention 4 runs on CUDA only"
+    if batch_invariant:
+        return "VLLM_BATCH_INVARIANT selects FlashAttention 2"
+    if not platform.is_device_capability_family(90):
+        return (
+            "FlashAttention 4 applies a per-sequence causal flag on Hopper "
+            "(compute capability 9.x) only"
+        )
+    return None
+
+
 def _fa4_platform_reason(vllm_config: Any) -> str | None:
     """Why FlashAttention 4 cannot serve the per-sequence flag on this engine:
-    the platform (CUDA only, not under VLLM_BATCH_INVARIANT) and the version the
-    backend resolves for every head size the model declares; None when it can.
-    Tests replace this function."""
+    the device (_fa4_device_reason) and the version the backend resolves for
+    every head size the model declares; None when it can. Tests replace this
+    function."""
     import vllm.envs as envs
     from vllm.platforms import current_platform
 
-    if not current_platform.is_cuda():
-        return "FlashAttention 4 runs on CUDA only"
-    if envs.VLLM_BATCH_INVARIANT:
-        return "VLLM_BATCH_INVARIANT selects FlashAttention 2"
+    reason = _fa4_device_reason(current_platform, envs.VLLM_BATCH_INVARIANT)
+    if reason is not None:
+        return reason
     from vllm.config import set_current_vllm_config
     from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 
@@ -159,6 +172,18 @@ def check_bidirectional_request(
     causal and must never be stored or loaded under token hashes."""
     if sampling_params.max_tokens != 1:
         raise ValueError(BIDIRECTIONAL_NEEDS_ONE_TOKEN)
+    model_config = vllm_config.model_config
+    v_head_dim = getattr(
+        getattr(model_config, "hf_text_config", None), "v_head_dim", None
+    )
+    if v_head_dim is not None and int(v_head_dim) != int(model_config.get_head_size()):
+        # such models choose their own (DiffKV) attention backend, which has
+        # no per-sequence path
+        raise ValueError(
+            "attention_mode 'bidirectional' is not served for a model whose value "
+            "head size differs from its key head size: its attention backend "
+            "applies no per-sequence causal flag"
+        )
     backend = vllm_config.attention_config.backend
     name = getattr(backend, "name", None)
     per_kind = getattr(vllm_config.attention_config, "backend_per_kind", None) or {}
@@ -172,8 +197,9 @@ def check_bidirectional_request(
     if name not in accepted:
         raise ValueError(
             "attention_mode 'bidirectional' needs --attention-backend TRITON_ATTN, "
-            "or FLASH_ATTN with attention_config.flash_attn_version=4 on a CUDA GPU "
-            f"that resolves to FlashAttention 4 for this model (got {name or 'auto'}"
+            "or FLASH_ATTN with attention_config.flash_attn_version=4 on a Hopper "
+            "GPU (compute capability 9.x) where FlashAttention 4 resolves for every "
+            f"head size of this model (got {name or 'auto'}"
             f"{'; ' + fa_reason if name == 'FLASH_ATTN' and fa_reason else ''}): "
             "only those apply a per-sequence causal flag"
         )

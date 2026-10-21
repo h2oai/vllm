@@ -194,6 +194,13 @@ class TritonAttentionDiffKVImpl(TritonAttentionImpl):
         key_cache = kv_cache[..., :head_size_qk]
         value_cache = kv_cache[..., head_size_qk : head_size_qk + head_size_v]
 
+        if isinstance(getattr(attn_metadata, "causal", True), torch.Tensor):
+            # the per-sequence causal flag (H2O per-request attention) has no
+            # path through this backend, which reads every row causally
+            raise NotImplementedError(
+                "A per-sequence causal flag is not served by the TRITON_ATTN_DIFFKV "
+                "backend"
+            )
         unified_attention_diffkv(
             q=query[:num_actual_tokens],
             k=key_cache,

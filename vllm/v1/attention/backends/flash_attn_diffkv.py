@@ -237,6 +237,13 @@ class FlashAttentionDiffKVImpl(FlashAttentionImpl):
                     if self.sliding_window is not None
                     else None
                 )
+                if isinstance(attn_metadata.causal, torch.Tensor):
+                    # the per-sequence causal flag (H2O per-request attention)
+                    # has no path through this backend: never read wrongly
+                    raise NotImplementedError(
+                        "A per-sequence causal flag is not served by the "
+                        "FLASH_ATTN_DIFFKV backend"
+                    )
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
                     k=key_cache,

@@ -1139,6 +1139,12 @@ class FlashAttentionImpl(AttentionImpl):
             requires_softcap=bool(self.logits_soft_cap),
             supports_fa4_hd256=True,
         )
+        # the vendored FlashAttention 4 applies dynamic_causal on Hopper
+        # (compute capability 9.x) only; decided once, raised on in forward
+        self.fa4_per_sequence_supported = (
+            self.vllm_flash_attn_version == 4
+            and current_platform.is_device_capability_family(90)
+        )
         if self.vllm_flash_attn_version == 4:
             # the per-sequence path swaps the vendored forward's JIT cache: look
             # it up now so a moved API fails at start-up, not on the first
@@ -1415,10 +1421,12 @@ class FlashAttentionImpl(AttentionImpl):
 
                 dynamic_causal = None
                 if isinstance(causal, torch.Tensor):
-                    if self.vllm_flash_attn_version != 4:
+                    if not self.fa4_per_sequence_supported:
                         raise NotImplementedError(
-                            "Per-sequence causal requires FA4. Current version: "
-                            f"FA{self.vllm_flash_attn_version}"
+                            "A per-sequence causal flag needs FlashAttention 4 on "
+                            "Hopper (compute capability 9.x); this layer runs "
+                            f"FlashAttention {self.vllm_flash_attn_version} on "
+                            f"capability {current_platform.get_device_capability()}"
                         )
                     dynamic_causal = causal
                     has_window = (

@@ -268,6 +268,7 @@ def _config(
     rswa=None,
     mm_prefix=False,
     bidirectional="none",
+    v_head_dim=None,
 ):
     backend = SimpleNamespace(name=backend_name) if backend_name else None
     return SimpleNamespace(
@@ -283,7 +284,10 @@ def _config(
         model_config=SimpleNamespace(
             rswa_window=rswa,
             is_mm_prefix_lm=mm_prefix,
-            hf_text_config=SimpleNamespace(use_bidirectional_attention=bidirectional),
+            get_head_size=lambda: 128,
+            hf_text_config=SimpleNamespace(
+                use_bidirectional_attention=bidirectional, v_head_dim=v_head_dim
+            ),
         ),
         kv_transfer_config=SimpleNamespace() if kv_connector else None,
         reasoning_config=None,
@@ -320,6 +324,13 @@ def test_a_bidirectional_request_is_refused_where_it_cannot_be_served(monkeypatc
     decoding = SamplingParams(max_tokens=4, extra_args={"attention_mode": "two-way"})
     with pytest.raises(ValueError, match="max_tokens=1"):
         check_bidirectional_request(decoding, _config("TRITON_ATTN", False))
+    # a model whose value head size differs from its key head size picks its
+    # own (DiffKV) backend, which has no per-sequence path: refused everywhere
+    with pytest.raises(ValueError, match="value head size"):
+        check_bidirectional_request(
+            two_way, _config("TRITON_ATTN", False, v_head_dim=64)
+        )
+    check_bidirectional_request(two_way, _config("TRITON_ATTN", False, v_head_dim=128))
     # a per-kind override that routes any attention kind elsewhere is refused too
     with pytest.raises(ValueError, match="backend_per_kind"):
         check_bidirectional_request(
@@ -406,40 +417,56 @@ def test_the_fa4_dynamic_causal_cache_swap(monkeypatch):
             assert fwd.compile_cache is dynamic
         assert fwd.compile_cache is dynamic
     assert fwd.compile_cache is regular
-    with pytest.raises(RuntimeError):  # noqa: SIM117 (the nesting is the point)
-        with fa._fa4_cache_for(tensor):
-            raise RuntimeError("compile failed")
-    assert fwd.compile_cache is regular
-    fa._fa4_dynamic_causal_cache.cache_clear()
+    try:
+        with pytest.raises(RuntimeError):  # noqa: SIM117 (the nesting is the point)
+            with fa._fa4_cache_for(tensor):
+                raise RuntimeError("compile failed")
+        assert fwd.compile_cache is regular
+    finally:
+        fa._fa4_dynamic_causal_cache.cache_clear()
+
+
+class _Arch:
+    """A model architecture config with a whole-model head size and, when the
+    layers differ, each layer's own (the real one's per_layer_overrides and
+    per-layer view)."""
+
+    def __init__(self, head_size, per_layer=None):
+        self.head_size = head_size
+        self.total_num_hidden_layers = len(per_layer) if per_layer else 1
+        self.per_layer_overrides = (
+            [{"head_size": h} for h in per_layer] if per_layer else None
+        )
+
+    def __getitem__(self, i):
+        return SimpleNamespace(head_size=self.per_layer_overrides[i]["head_size"])
 
 
 def test_the_guard_resolves_the_version_for_every_declared_head_size():
     """The FLASH_ATTN check resolves the FlashAttention version for every head
-    size the model declares (the main one, a global_head_dim, per_layer_config
-    entries), with ALiBi and softcapping passed on, and names the first head
+    size the model's architecture config declares (the whole-model one, or each
+    layer's own where layers differ, as Gemma-4's sliding and full-attention
+    layers do), with ALiBi and softcapping passed on, and names the first head
     size that does not resolve to 4: a layer on FlashAttention 2 or 3 would
     raise on the per-sequence flag, so the request is refused up front."""
     from vllm.v1.request import _declared_head_sizes, _fa4_version_reason
 
-    def model(head, text=None, alibi=False):
+    def model(head, per_layer=None, softcap=None, alibi=False, arch=True):
         return SimpleNamespace(
             get_head_size=lambda: head,
-            hf_text_config=SimpleNamespace(**(text or {})),
+            model_arch_config=_Arch(head, per_layer) if arch else None,
+            hf_text_config=SimpleNamespace(attn_logit_softcapping=softcap),
             uses_alibi=alibi,
         )
 
     assert _declared_head_sizes(model(128)) == [128]
-    assert _declared_head_sizes(model(256, {"global_head_dim": 512})) == [256, 512]
-    gemma_style = {
-        "per_layer_config": {"05": {"head_dim": 512, "num_key_value_heads": 4}},
-        "attn_logit_softcapping": None,
-    }
-    assert _declared_head_sizes(model(256, gemma_style)) == [256, 512]
-    assert _declared_head_sizes(model(256, {"per_layer_config": "x"})) == [256]
+    assert _declared_head_sizes(model(128, arch=False)) == [128]  # no arch config
+    gemma = model(512, per_layer=[256, 256, 512, 256, 512])  # whole-model = max
+    assert _declared_head_sizes(gemma) == [256, 512]
 
     seen = []
 
-    def resolve(**kw):  # FlashAttention 4 up to head 256, 2 above (Blackwell)
+    def resolve(**kw):  # a resolver that stops at head 256
         seen.append(kw)
         return 4 if kw["head_size"] <= 256 else 2
 
@@ -450,20 +477,44 @@ def test_the_guard_resolves_the_version_for_every_declared_head_size():
         "requires_softcap": False,
         "supports_fa4_hd256": True,
     }
-    assert _fa4_version_reason(model(256, gemma_style), resolve) == (
+    assert _fa4_version_reason(gemma, resolve) == (
         "FlashAttention 2 resolves for head size 512"
     )
-    assert _fa4_version_reason(model(256, {"global_head_dim": 512}), resolve) == (
-        "FlashAttention 2 resolves for head size 512"
-    )
+    assert [kw["head_size"] for kw in seen[-2:]] == [256, 512]  # every size, in order
     # ALiBi and softcapping reach the resolver
-    _fa4_version_reason(
-        model(128, {"attn_logit_softcapping": 30.0}, alibi=True), resolve
-    )
+    _fa4_version_reason(model(128, softcap=30.0, alibi=True), resolve)
     assert seen[-1]["requires_alibi"] is True and seen[-1]["requires_softcap"] is True
     # no version at all (an unsupported GPU for the forced version): named too
     assert _fa4_version_reason(model(128), lambda **kw: None) == (
         "FlashAttention no version resolves for head size 128"
+    )
+
+
+def test_the_per_sequence_fa4_path_is_hopper_only():
+    """The vendored FlashAttention 4 applies dynamic_causal on compute
+    capability 9.x only (its Blackwell kernels take the argument and ignore
+    it), so the device check refuses every other capability family, a
+    non-CUDA platform and batch-invariant mode, and admits Hopper."""
+    from vllm.v1.request import _fa4_device_reason
+
+    def platform(cuda=True, family=90):
+        return SimpleNamespace(
+            is_cuda=lambda: cuda,
+            is_device_capability_family=lambda c: c // 10 == family // 10,
+        )
+
+    assert _fa4_device_reason(platform(), False) is None
+    assert _fa4_device_reason(platform(family=100), False) == (
+        "FlashAttention 4 applies a per-sequence causal flag on Hopper "
+        "(compute capability 9.x) only"
+    )
+    assert "Hopper" in _fa4_device_reason(platform(family=120), False)
+    assert "Hopper" in _fa4_device_reason(platform(family=80), False)
+    assert _fa4_device_reason(platform(cuda=False), False) == (
+        "FlashAttention 4 runs on CUDA only"
+    )
+    assert _fa4_device_reason(platform(), True) == (
+        "VLLM_BATCH_INVARIANT selects FlashAttention 2"
     )
 
 

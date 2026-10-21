@@ -26,6 +26,7 @@ import os
 import pytest
 import torch
 
+from tests.utils import create_new_process_for_each_test
 from vllm import SamplingParams
 from vllm.config import PoolerConfig
 from vllm.distributed import cleanup_dist_env_and_memory
@@ -302,6 +303,9 @@ def _one_engine_label_probs(vllm_runner, prompts, label_ids):
     return probs[0::2], probs[1::2]
 
 
+# a fresh process: the in-process engine core below freezes the environment
+# cache and keeps its GPU memory, which must not reach other tests
+@create_new_process_for_each_test()
 def test_flagged_read_is_the_two_way_pooling_read_and_unflagged_the_causal_one(
     vllm_runner, monkeypatch
 ):
