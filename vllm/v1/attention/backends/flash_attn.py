@@ -1139,12 +1139,6 @@ class FlashAttentionImpl(AttentionImpl):
             requires_softcap=bool(self.logits_soft_cap),
             supports_fa4_hd256=True,
         )
-        # the vendored FlashAttention 4 applies dynamic_causal on Hopper
-        # (compute capability 9.x) only; decided once, raised on in forward
-        self.fa4_per_sequence_supported = (
-            self.vllm_flash_attn_version == 4
-            and current_platform.is_device_capability_family(90)
-        )
         if self.vllm_flash_attn_version == 4:
             # the per-sequence path swaps the vendored forward's JIT cache: look
             # it up now so a moved API fails at start-up, not on the first
@@ -1164,6 +1158,13 @@ class FlashAttentionImpl(AttentionImpl):
             )
             self.vllm_flash_attn_version = 2
             self.fa4_hd256 = False
+        # the vendored FlashAttention 4 applies dynamic_causal on Hopper
+        # (compute capability 9.x) only; decided once the version is final,
+        # raised on in forward
+        self.fa4_per_sequence_supported = (
+            self.vllm_flash_attn_version == 4
+            and current_platform.is_device_capability_family(90)
+        )
         logger.info_once(
             "Using FlashAttention version %s",
             self.vllm_flash_attn_version,
