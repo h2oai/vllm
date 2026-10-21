@@ -69,6 +69,25 @@ def check_bidirectional_request(sampling_params: SamplingParams, vllm_config) ->
     loaded under token hashes."""
     if sampling_params.max_tokens != 1:
         raise ValueError(BIDIRECTIONAL_NEEDS_ONE_TOKEN)
+    model_config = vllm_config.model_config
+    text_config = getattr(model_config, "hf_text_config", None)
+    head_size = int(model_config.get_head_size())
+    value_sizes = [
+        getattr(text_config, name, None) for name in ("v_head_dim", "v_channels")
+    ]
+    if (
+        any(v is not None and int(v) != head_size for v in value_sizes)
+        or (getattr(text_config, "param_sink_number", 0) or 0) > 0
+    ):
+        # such models (a value head size of their own, or parametric attention
+        # sinks) choose their own DiffKV attention backend, which has no
+        # per-sequence path
+        raise ValueError(
+            "attention_mode 'bidirectional' is not served for a model whose value "
+            "head size differs from its key head size or that uses parametric "
+            "attention sinks: its attention backend applies no per-sequence "
+            "causal flag"
+        )
     backend = vllm_config.attention_config.backend
     if backend is None or getattr(backend, "name", None) != "TRITON_ATTN":
         raise ValueError(

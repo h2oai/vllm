@@ -259,7 +259,19 @@ def test_a_deferred_bidirectional_prompt_ages_and_holds_admission(monkeypatch):
     assert scheduler.requests["two_way"].bidirectional_deferrals >= 8
 
 
-def _config(backend_name, kv_connector, per_kind=None):
+def _config(
+    backend_name,
+    kv_connector,
+    per_kind=None,
+    fa_version=None,
+    dcp=1,
+    rswa=None,
+    mm_prefix=False,
+    bidirectional="none",
+    v_head_dim=None,
+    v_channels=None,
+    sinks=0,
+):
     backend = SimpleNamespace(name=backend_name) if backend_name else None
     return SimpleNamespace(
         attention_config=SimpleNamespace(
@@ -268,6 +280,19 @@ def _config(backend_name, kv_connector, per_kind=None):
                 kind: SimpleNamespace(name=name)
                 for kind, name in (per_kind or {}).items()
             },
+            flash_attn_version=fa_version,
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp),
+        model_config=SimpleNamespace(
+            rswa_window=rswa,
+            is_mm_prefix_lm=mm_prefix,
+            get_head_size=lambda: 128,
+            hf_text_config=SimpleNamespace(
+                use_bidirectional_attention=bidirectional,
+                v_head_dim=v_head_dim,
+                v_channels=v_channels,
+                param_sink_number=sinks,
+            ),
         ),
         kv_transfer_config=SimpleNamespace() if kv_connector else None,
         reasoning_config=None,
@@ -298,6 +323,20 @@ def test_a_bidirectional_request_is_refused_where_it_cannot_be_served():
     decoding = SamplingParams(max_tokens=4, extra_args={"attention_mode": "two-way"})
     with pytest.raises(ValueError, match="max_tokens=1"):
         check_bidirectional_request(decoding, _config("TRITON_ATTN", False))
+    # a model whose value head size differs from its key head size picks its
+    # own (DiffKV) backend, which has no per-sequence path: refused everywhere
+    with pytest.raises(ValueError, match="value head size"):
+        check_bidirectional_request(
+            two_way, _config("TRITON_ATTN", False, v_head_dim=64)
+        )
+    with pytest.raises(ValueError, match="value head size"):
+        check_bidirectional_request(
+            two_way, _config("TRITON_ATTN", False, v_channels=64)
+        )
+    with pytest.raises(ValueError, match="attention sinks"):
+        check_bidirectional_request(two_way, _config("TRITON_ATTN", False, sinks=2))
+    check_bidirectional_request(two_way, _config("TRITON_ATTN", False, v_head_dim=128))
+    check_bidirectional_request(two_way, _config("TRITON_ATTN", False, v_channels=128))
     # a per-kind override that routes any attention kind elsewhere is refused too
     with pytest.raises(ValueError, match="backend_per_kind"):
         check_bidirectional_request(
