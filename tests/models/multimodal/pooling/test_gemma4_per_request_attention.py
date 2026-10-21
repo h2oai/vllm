@@ -303,17 +303,20 @@ def _one_engine_label_probs(vllm_runner, prompts, label_ids):
     return probs[0::2], probs[1::2]
 
 
-# a fresh process: the in-process engine core below freezes the environment
-# cache and keeps its GPU memory, which must not reach other tests
-@create_new_process_for_each_test()
+# a fresh interpreter (spawned, not forked: the in-process engine core below
+# initialises CUDA in this process, which a fork of a CUDA-touched parent may
+# not do): the engine core freezes the environment cache and keeps its GPU
+# memory, neither of which must reach other tests, and the environment
+# settings below are made directly on this throwaway process
+@create_new_process_for_each_test("spawn")
 def test_flagged_read_is_the_two_way_pooling_read_and_unflagged_the_causal_one(
-    vllm_runner, monkeypatch
+    vllm_runner,
 ):
     if not _model_accessible():  # at run time, not at collection: a network call
         pytest.skip(f"model {MODEL} is not accessible here")
-    # this test process is a fork of one that has touched CUDA (the GPU checks
-    # at import), so the engine processes below must be spawned, never forked
-    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    # this process has touched CUDA (the GPU checks at import), so the engine
+    # processes of the references below must be spawned, never forked
+    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(MODEL)
@@ -334,7 +337,7 @@ def test_flagged_read_is_the_two_way_pooling_read_and_unflagged_the_causal_one(
     cleanup_dist_env_and_memory()
     ref_one_way = _pooling_label_probs(vllm_runner, PROMPTS, W, cap, noncausal=False)
     cleanup_dist_env_and_memory()
-    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     two_way, one_way = _one_engine_label_probs(vllm_runner, PROMPTS, label_ids)
 
     torch.set_printoptions(precision=4, sci_mode=False, linewidth=120)
