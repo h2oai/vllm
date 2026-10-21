@@ -700,7 +700,13 @@ def make_kv_sharing_fast_prefill_common_attn_metadata(
         max_seq_len=common_attn_metadata.max_seq_len,
         block_table_tensor=common_attn_metadata.block_table_tensor,
         slot_mapping=common_attn_metadata.slot_mapping,
-        causal=True,
+        # H2O per-request attention: the per-sequence causal flag (a tensor
+        # over the same requests) is kept, so a logits row of a bidirectional
+        # request attends both ways in the KV-shared layers. At a request's
+        # last prompt token (the one-engine readout) causal and bidirectional
+        # see the same keys; an earlier logits row of a two-way request needs
+        # the flag to match the full forward.
+        causal=common_attn_metadata.causal,
         seq_lens_cpu_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound,
     )
     return common_attn_metadata

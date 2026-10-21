@@ -293,10 +293,19 @@ class Gemma4Config(VerifyAndUpdateConfig):
         if not getattr(model_config.hf_text_config, "is_causal", True) and (
             vllm_config.cache_config.kv_sharing_fast_prefill
         ):
+            # The two-way reading with fast prefill is the per-request one
+            # (a causal checkpoint, vllm_xargs attention_mode=bidirectional,
+            # generate runner): its KV-shared layers read the cache the lower
+            # layers wrote in the same step, so running them on the logits
+            # rows only is exact. A checkpoint declared non-causal is served
+            # by the pooling runner, whose KV-shared layers take K/V from the
+            # source layer's forward (no cache), with no logits rows.
             raise ValueError(
                 "kv_sharing_fast_prefill is not supported with Gemma4 non-causal "
                 "full attention (its KV-shared layers take K/V from the source "
-                "layer's forward, not from a cache)"
+                "layer's forward, not from a cache); for two-way reads with "
+                "fast prefill serve the causal checkpoint and send "
+                "attention_mode=bidirectional per request"
             )
         arch_config = model_config.model_arch_config
         layer_types = getattr(model_config.hf_text_config, "layer_types", None) or []
