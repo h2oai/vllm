@@ -307,13 +307,6 @@ def test_flagged_read_is_the_two_way_pooling_read_and_unflagged_the_causal_one(
 ):
     if not _model_accessible():  # at run time, not at collection: a network call
         pytest.skip(f"model {MODEL} is not accessible here")
-    # the one-step check below needs the engine core in this process: the
-    # multiprocess core schedules as soon as it holds a request, so on a slow
-    # or loaded host it can start the batch before every request has arrived
-    # and split it over two steps for timing reasons alone (seen on a loaded
-    # workstation and in a container); in-process, generate() adds every
-    # request before the first step
-    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(MODEL)
@@ -321,11 +314,21 @@ def test_flagged_read_is_the_two_way_pooling_read_and_unflagged_the_causal_one(
         tok(label, add_special_tokens=False)["input_ids"][-1] for label in LABELS
     ]
     W, cap = _label_rows(MODEL, label_ids)
-    two_way, one_way = _one_engine_label_probs(vllm_runner, PROMPTS, label_ids)
-    cleanup_dist_env_and_memory()
+    # the pooling references first, each in its own engine process that exits
+    # and frees the GPU; the generate engine comes last and runs its engine
+    # core in THIS process: the multiprocess core schedules as soon as it holds
+    # a request, so on a slow or loaded host it can start the mixed batch
+    # before every request has arrived and split it over two steps for timing
+    # reasons alone (seen on a loaded workstation and in a container), which
+    # the one-step check would report as serialisation; in-process, generate()
+    # adds every request before the first step. (An in-process engine's memory
+    # is not returned before the next engine starts, hence the order.)
     ref_two_way = _pooling_label_probs(vllm_runner, PROMPTS, W, cap, noncausal=True)
     cleanup_dist_env_and_memory()
     ref_one_way = _pooling_label_probs(vllm_runner, PROMPTS, W, cap, noncausal=False)
+    cleanup_dist_env_and_memory()
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    two_way, one_way = _one_engine_label_probs(vllm_runner, PROMPTS, label_ids)
 
     torch.set_printoptions(precision=4, sci_mode=False, linewidth=120)
     print("one-way (one engine, unflagged):", one_way, sep="\n")
