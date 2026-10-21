@@ -270,7 +270,9 @@ def _one_engine_label_probs(vllm_runner, prompts, label_ids):
         # scheduling may add one near-empty iteration (the decode step it
         # schedules before the finish is seen, one token per request), so the
         # check counts the iterations that carried more than two tokens per
-        # request (the histogram's 16-token bucket for 12 prompts).
+        # request (the histogram's 16-token bucket for 12 prompts; the
+        # buckets are Prometheus-style cumulative counts). The engine core
+        # runs in-process for this (see the top of the test).
         total = sum(len(o.prompt_token_ids) for o in outputs)
         iterations = after[0] - before[0]
         big = _iterations_above(before, after, 2 * len(mixed))
@@ -301,10 +303,17 @@ def _one_engine_label_probs(vllm_runner, prompts, label_ids):
 
 
 def test_flagged_read_is_the_two_way_pooling_read_and_unflagged_the_causal_one(
-    vllm_runner,
+    vllm_runner, monkeypatch
 ):
     if not _model_accessible():  # at run time, not at collection: a network call
         pytest.skip(f"model {MODEL} is not accessible here")
+    # the one-step check below needs the engine core in this process: the
+    # multiprocess core schedules as soon as it holds a request, so on a slow
+    # or loaded host it can start the batch before every request has arrived
+    # and split it over two steps for timing reasons alone (seen on a loaded
+    # workstation and in a container); in-process, generate() adds every
+    # request before the first step
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(MODEL)
