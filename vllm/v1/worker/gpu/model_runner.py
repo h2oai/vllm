@@ -29,6 +29,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm import h2o_exits
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
@@ -334,6 +335,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # H2O per-request attention: req_id -> "bidirectional" for the requests that asked for it, and a persistent
         # int32 buffer for the per-sequence causal flags (1 = causal) handed to the attention metadata
         self.req_attention_mode: dict[str, str] = {}
+        # H2O early exit (vllm/h2o_exits.py): per-request exit policy state and the last step's depth_used
+        self.req_exit: dict[str, dict] = {}
+        self.h2o_depth_used: dict[str, int] = {}
         self.attention_causal_gpu = torch.ones(self.max_num_reqs + 1, dtype=torch.int32, device=self.device)
         self.adaptive_verification: AdaptiveVerificationManager | None = None
         self.input_buffers = InputBuffers(
@@ -447,6 +451,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             format_gib(m.consumed_memory),
             time_after_load - time_before_load,
         )
+        # H2O early exit: add-on heads beside the weights (no-op unless VLLM_H2O_EXITS is set)
+        h2o_exits.load(self.model, self.model_config.model, self.device)
 
         # Initialize the components that require the model.
         self.model_state = init_model_state(
@@ -1095,8 +1101,66 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return cuda_graph_size
 
+    # ---- H2O early exit (vllm/h2o_exits.py) -------------------------------
+    def _h2o_exit_step(self, scheduler_output, input_batch):
+        """v1 batch rule: an exit step only when every request in the batch has an
+        exit policy, finishes its prefill now, and has label token ids."""
+        h2o_exits.STEP = None
+        heads = h2o_exits.HEADS
+        if heads is None or not self.req_exit or input_batch.num_reqs == 0:
+            return None
+        label_ids, temps, depths = [], [], []
+        for rid in input_batch.req_ids[: input_batch.num_reqs]:
+            st = self.req_exit.get(rid)
+            if st is None or not st["ids"]:
+                return None
+            if st["computed"] + scheduler_output.num_scheduled_tokens[rid] < st["prompt_len"]:
+                return None
+            pol = st["pol"]
+            ks = heads.auto if pol["depths"] == "auto" else pol["depths"]
+            ks = [k for k in ks if k in heads.layers]
+            if not ks:
+                return None
+            label_ids.append(st["ids"])
+            temps.append(pol["temp"])
+            depths.append((ks, pol["tau"]))
+        rows = input_batch.logits_indices[: input_batch.num_reqs]
+        dev = rows.device
+        step = h2o_exits.ExitStep(
+            rows=rows,
+            label_ids=label_ids,
+            temps=torch.tensor(temps, device=dev, dtype=torch.float32),
+            allowed={k: torch.tensor([k in ks for ks, _ in depths], device=dev) for k in heads.layers},
+            tau={
+                k: torch.tensor(
+                    [t.get(k, heads.default_tau.get(k, 2.0)) for _, t in depths],
+                    device=dev,
+                    dtype=torch.float32,
+                )
+                for k in heads.layers
+            },
+        )
+        h2o_exits.STEP = step
+        return step
+
+    def _h2o_record_depth(self, scheduler_output, input_batch, k):
+        """depth_used for every request with an exit policy in this step; advance
+        their computed-token counts."""
+        self.h2o_depth_used = {}
+        if not self.req_exit:
+            return
+        n_layers = self.model_config.hf_text_config.num_hidden_layers
+        for rid in input_batch.req_ids[: input_batch.num_reqs]:
+            st = self.req_exit.get(rid)
+            if st is None:
+                continue
+            st["computed"] += scheduler_output.num_scheduled_tokens.get(rid, 0)
+            if h2o_exits.HEADS is not None:
+                self.h2o_depth_used[rid] = k if k is not None else n_layers
+
     def _remove_request(self, req_id: str) -> bool:
         self.req_attention_mode.pop(req_id, None)
+        self.req_exit.pop(req_id, None)
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
         self.model_state.remove_request(req_id)
@@ -1162,6 +1226,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             prompt_len = new_req_data.prompt_len
             sampling_params = new_req_data.sampling_params
+            exit_policy = h2o_exits.parse_exit_policy(sampling_params)
+            if exit_policy is not None:
+                self.req_exit[req_id] = dict(
+                    pol=exit_policy,
+                    ids=list(getattr(sampling_params, "logprob_token_ids", None) or []),
+                    prompt_len=prompt_len,
+                    computed=new_req_data.num_computed_tokens,
+                )
             self.req_states.add_request(
                 req_id=req_id,
                 prompt_len=prompt_len,
@@ -1743,7 +1815,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_rank,
             max_query_len=max_query_len,
             need_eager=is_profile or skip_compiled,
-            no_full=has_bidirectional,
+            no_full=has_bidirectional
+            or (
+                h2o_exits.HEADS is not None
+                and any(
+                    rid in self.req_exit
+                    for rid in getattr(scheduler_output, "num_scheduled_tokens", {})
+                )
+            ),
             num_active_loras=num_active_loras,
             parallel_config=self.parallel_config,
             allow_ubatching=(
@@ -1983,22 +2062,41 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 is_padding=input_batch.is_padding,
             ):
                 self.kv_connector.pre_forward(**connector_kwargs)
-                if ubatch_state is not None:
-                    assert self.ubatch_runner is not None
-                    model_output = self.ubatch_runner.run(
-                        self.model, model_inputs, ubatch_state
+                h2o_step = (
+                    None if dummy_run else self._h2o_exit_step(scheduler_output, input_batch)
+                )
+                h2o_k = None
+                try:
+                    if ubatch_state is not None:
+                        assert self.ubatch_runner is not None
+                        model_output = self.ubatch_runner.run(
+                            self.model, model_inputs, ubatch_state
+                        )
+                    elif batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                        # Run the PIECEWISE graph (compiled PW cudagraph or breakable
+                        # cudagraph, chosen inside run_pw_graph). cg_mode is only
+                        # PIECEWISE after the cudagraph manager exists.
+                        assert self.cudagraph_manager is not None
+                        model_output = self.cudagraph_manager.run_pw_graph(
+                            self.model, model_inputs
+                        )
+                    else:
+                        # Eager (NONE): call the raw model directly.
+                        model_output = self.model(**model_inputs)
+                except h2o_exits.H2OExit as e:
+                    # every request exited at layer e.k: the answer-slot rows carry the
+                    # exits' normed states; the lm_head / logprob readout is unchanged
+                    h2o_k = e.k
+                    model_output = torch.zeros(
+                        (input_batch.num_tokens_after_padding, e.hidden.shape[-1]),
+                        dtype=e.hidden.dtype,
+                        device=e.hidden.device,
                     )
-                elif batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
-                    # Run the PIECEWISE graph (compiled PW cudagraph or breakable
-                    # cudagraph, chosen inside run_pw_graph). cg_mode is only
-                    # PIECEWISE after the cudagraph manager exists.
-                    assert self.cudagraph_manager is not None
-                    model_output = self.cudagraph_manager.run_pw_graph(
-                        self.model, model_inputs
-                    )
-                else:
-                    # Eager (NONE): call the raw model directly.
-                    model_output = self.model(**model_inputs)
+                    model_output[h2o_step.rows] = e.hidden
+                finally:
+                    h2o_exits.STEP = None
+                if not dummy_run:
+                    self._h2o_record_depth(scheduler_output, input_batch, h2o_k)
 
         self.kv_connector.finish_forward()
 
@@ -2130,6 +2228,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
             cudagraph_stats=cudagraph_stats,
+            h2o_depth_used=self.h2o_depth_used or None,
         )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(
