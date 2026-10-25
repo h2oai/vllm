@@ -31,7 +31,11 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
 from vllm.utils.async_utils import make_async
 from vllm.utils.jsontree import json_iter_leaves
 from vllm.v1.engine import EngineCoreRequest
-from vllm.v1.request import check_bidirectional_request, parse_attention_mode
+from vllm.v1.request import (
+    check_bidirectional_request,
+    parse_attention_mode,
+    parse_prefix_cache_write,
+)
 
 logger = init_logger(__name__)
 
@@ -110,6 +114,10 @@ class InputProcessor:
                     check_bidirectional_request(params, self.vllm_config)
             except ValueError as e:
                 raise VLLMValidationError(str(e), parameter="attention_mode") from e
+            try:
+                parse_prefix_cache_write(params)
+            except ValueError as e:
+                raise VLLMValidationError(str(e), parameter="prefix_cache_write") from e
 
             if self.model_config.return_sampling_mask:
                 if params.temperature <= 0:

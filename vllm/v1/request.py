@@ -59,6 +59,27 @@ def parse_attention_mode(sampling_params: SamplingParams | None) -> str:
     return mode
 
 
+def parse_prefix_cache_write(sampling_params: SamplingParams | None) -> bool:
+    """H2O per-request prefix-cache writes: ``extra_args`` (``vllm_xargs``)
+    ``prefix_cache_write`` false keeps a causal request out of the prefix cache
+    as a writer. It still reads the blocks other requests cached, but commits
+    none of its own, so with Mamba "align" caching its prefill is not split at
+    the last state-block boundary (the split exists only to land a cacheable
+    state there) and runs in one step. Default true (stock behaviour). A bool,
+    or "true"/"false"/"1"/"0"; anything else is a ValueError."""
+    if sampling_params is None or not sampling_params.extra_args:
+        return True
+    value = sampling_params.extra_args.get("prefix_cache_write")
+    if value is None or isinstance(value, bool):
+        return value is not False
+    text = str(value).strip().lower()
+    if text in ("true", "1"):
+        return True
+    if text in ("false", "0"):
+        return False
+    raise ValueError(f"prefix_cache_write must be true or false, got {value!r}")
+
+
 def _declared_head_sizes(model_config: Any) -> list[int]:
     """Every attention head size the model declares, from its architecture
     config: the whole-model head size, or each layer's own where layers differ
@@ -428,6 +449,9 @@ class Request:
             if self.max_tokens != 1:
                 raise ValueError(BIDIRECTIONAL_NEEDS_ONE_TOKEN)
             block_hasher = None  # no prefix-cache reads or writes for this request
+        # H2O per-request prefix-cache writes: False = read cached blocks, commit
+        # none (and no Mamba block-aligned prefill split for this request)
+        self.prefix_cache_write = parse_prefix_cache_write(sampling_params)
         # steps this request was deferred for lack of room (bounded aging in the
         # scheduler)
         self.bidirectional_deferrals = 0

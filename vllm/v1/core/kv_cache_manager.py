@@ -31,6 +31,17 @@ from vllm.v1.request import Request, RequestStatus
 logger = init_logger(__name__)
 
 
+def _commits_to_cache(request: Request) -> bool:
+    """Whether a request's computed blocks are committed to the prefix cache:
+    not for a bidirectional request (no block hashes; its KV is not causal) and
+    not for one with prefix_cache_write false (H2O per-request attention)."""
+    if not getattr(request, "prefix_cache_write", True):
+        return False
+    return bool(request.block_hashes) or (
+        getattr(request, "attention_mode", "causal") != "bidirectional"
+    )
+
+
 @dataclass
 class KVCacheBlocks:
     """
@@ -607,8 +618,9 @@ class KVCacheManager:
         )
         # H2O per-request attention: a bidirectional request carries no block
         # hashes (its KV is not causal and must never be shared through the
-        # prefix cache), so there is nothing to cache for it.
-        if request.block_hashes or getattr(request, "attention_mode", "causal") != "bidirectional":
+        # prefix cache), so there is nothing to cache for it; a request with
+        # prefix_cache_write false reads the cache and commits nothing.
+        if _commits_to_cache(request):
             self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
@@ -806,11 +818,10 @@ class KVCacheManager:
             num_computed_tokens: The number of computed tokens, including tokens
                 that are already cached and tokens to be cached.
         """
-        if self.enable_caching and (
-            request.block_hashes or getattr(request, "attention_mode", "causal") != "bidirectional"
-        ):
+        if self.enable_caching and _commits_to_cache(request):
             # H2O per-request attention: a bidirectional request has no block
-            # hashes and its (non-causal) KV is never committed to the cache
+            # hashes and its (non-causal) KV is never committed to the cache;
+            # neither is a request with prefix_cache_write false
             self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(

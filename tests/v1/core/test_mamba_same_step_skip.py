@@ -101,3 +101,98 @@ def test_shortage_of_blocks_still_ends_the_scan():
     assert "first" in output.num_scheduled_tokens
     assert "second" not in output.num_scheduled_tokens
     assert not scheduler.kv_cache_manager.deferred_by_same_step_hit("second")
+
+
+def _one(req_id: str, same_as_siblings: bool = True):
+    if same_as_siblings:
+        return create_requests(
+            num_requests=1,
+            num_tokens=PROMPT_LEN,
+            same_prompt=True,
+            max_tokens=1,
+            block_size=BLOCK_SIZE,
+            req_ids=[req_id],
+        )[0]
+    return _siblings_and_other()[1]
+
+
+def _hit(output, req_id):
+    """Prefix-cache tokens of a newly scheduled request (before this step)."""
+    return next(
+        r.num_computed_tokens for r in output.scheduled_new_reqs if r.req_id == req_id
+    )
+
+
+def _finish_prefill(scheduler, output):
+    from vllm.v1.outputs import ModelRunnerOutput
+
+    req_ids = list(output.num_scheduled_tokens)
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={r: i for i, r in enumerate(req_ids)},
+            sampled_token_ids=[[1] for _ in req_ids],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+
+def test_no_cache_write_prefills_in_one_step_and_caches_nothing():
+    scheduler = _align_scheduler()
+    reader = _one("reader")
+    reader.prefix_cache_write = False
+    scheduler.add_request(reader)
+    output = scheduler.schedule()
+    # the whole prompt in one step: no split at the last state-block boundary
+    assert output.num_scheduled_tokens["reader"] == PROMPT_LEN
+    _finish_prefill(scheduler, output)
+
+    # it committed nothing: the same prompt again finds no cached prefix
+    writer = _one("writer")
+    scheduler.add_request(writer)
+    output = scheduler.schedule()
+    assert _hit(output, "writer") == 0
+    # a writer is split at the boundary as before (32 of 40 tokens)
+    assert output.num_scheduled_tokens["writer"] == 2 * BLOCK_SIZE
+
+
+def test_no_cache_write_reads_a_cached_prefix():
+    scheduler = _align_scheduler()
+    writer = _one("writer")
+    scheduler.add_request(writer)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens["writer"] == 2 * BLOCK_SIZE
+    _finish_prefill(scheduler, output)
+    output = scheduler.schedule()
+    _finish_prefill(scheduler, output)
+
+    reader = _one("reader")
+    reader.prefix_cache_write = False
+    scheduler.add_request(reader)
+    output = scheduler.schedule()
+    # the cached state block is read; the rest of the prompt runs in one step
+    assert _hit(output, "reader") == 2 * BLOCK_SIZE
+    assert output.num_scheduled_tokens["reader"] == PROMPT_LEN - 2 * BLOCK_SIZE
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, True), (True, True), (False, False), ("false", False), ("1", True)],
+)
+def test_parse_prefix_cache_write(value, expected):
+    from vllm import SamplingParams
+    from vllm.v1.request import parse_prefix_cache_write
+
+    extra = {} if value is None else {"prefix_cache_write": value}
+    assert parse_prefix_cache_write(SamplingParams(extra_args=extra)) is expected
+
+
+def test_parse_prefix_cache_write_refuses_other_values():
+    from vllm import SamplingParams
+    from vllm.v1.request import parse_prefix_cache_write
+
+    with pytest.raises(ValueError, match="prefix_cache_write"):
+        parse_prefix_cache_write(SamplingParams(extra_args={"prefix_cache_write": "x"}))

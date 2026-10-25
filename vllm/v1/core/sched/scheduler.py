@@ -686,6 +686,7 @@ class Scheduler(SchedulerInterface):
             if (
                 self.need_mamba_block_aligned_split
                 and getattr(request, "attention_mode", "causal") != "bidirectional"
+                and getattr(request, "prefix_cache_write", True)
             ):
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
@@ -1133,8 +1134,13 @@ class Scheduler(SchedulerInterface):
 
                     # Apply Mamba alignment before encoder caps (not to a
                     # bidirectional request: its prefill is never split and
-                    # its SSM state is never cached).
-                    if self.need_mamba_block_aligned_split and not bidirectional:
+                    # its SSM state is never cached; nor to a request that
+                    # writes nothing to the prefix cache).
+                    if (
+                        self.need_mamba_block_aligned_split
+                        and not bidirectional
+                        and getattr(request, "prefix_cache_write", True)
+                    ):
                         num_new_tokens = self._mamba_block_aligned_split(
                             request,
                             num_new_tokens,
