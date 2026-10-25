@@ -10,6 +10,7 @@
 # verify_wheel.py checks the result file by file against the upstream wheel.
 # Env: H2O_WHEEL_CACHE (where upstream wheels are kept; default OUT_DIR/.upstream), PYTHON (default python3).
 set -euo pipefail
+umask 022  # file modes in the wheel do not depend on the machine's umask
 
 VARIANT="${1:?usage: build_wheel.sh cu129|cu130 OUT_DIR}"
 OUT="${2:?usage: build_wheel.sh cu129|cu130 OUT_DIR}"
@@ -24,6 +25,8 @@ CACHE="${H2O_WHEEL_CACHE:-$OUT/.upstream}"; mkdir -p "$CACHE"
 
 [ -z "$(git -C "$REPO" status --porcelain --untracked-files=no)" ] || { echo "the checkout has uncommitted changes"; exit 1; }
 SHA="$(git -C "$REPO" rev-parse HEAD)"; SHORT="${SHA:0:10}"
+# zip timestamps from the commit time, so a rebuild of the same commit gives the same bytes
+SOURCE_DATE_EPOCH="$(git -C "$REPO" log -1 --format=%ct "$SHA")"; export SOURCE_DATE_EPOCH
 VERSION="${UPSTREAM_VERSION}+h2o.${SHORT}.${VARIANT}"
 
 # the fork must differ from the upstream release only where no compiled code comes from
