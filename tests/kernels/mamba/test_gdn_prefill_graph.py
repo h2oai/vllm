@@ -106,6 +106,7 @@ from vllm.platforms import current_platform  # noqa: E402
 needs_gpu = pytest.mark.skipif(
     not (
         current_platform.is_cuda()
+        and torch.cuda.is_available()
         and current_platform.has_device_capability(80)
         and not current_platform.is_device_capability_family(100)
     ),
