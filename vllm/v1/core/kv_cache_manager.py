@@ -33,9 +33,14 @@ logger = init_logger(__name__)
 
 def _commits_to_cache(request: Request) -> bool:
     """Whether a request's computed blocks are committed to the prefix cache:
-    not for a bidirectional request (no block hashes; its KV is not causal) and
-    not for one with prefix_cache_write false (H2O per-request attention)."""
+    not for a bidirectional request (no block hashes; its KV is not causal),
+    not for one with prefix_cache_write false (H2O per-request attention) and
+    not for one with an exit policy (H2O early exit)."""
     if not getattr(request, "prefix_cache_write", True):
+        return False
+    if getattr(request, "exit_policy", None) is not None and not request.block_hashes:
+        # H2O early exit: an exited pass leaves the layers above the exit
+        # unwritten, so such a request has no block hashes and commits nothing
         return False
     return bool(request.block_hashes) or (
         getattr(request, "attention_mode", "causal") != "bidirectional"
