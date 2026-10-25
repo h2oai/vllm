@@ -251,6 +251,15 @@ class KVCacheManager:
         """Whether a local prefix cache lookup may be run for this request."""
         return self.enable_caching and not request.skip_reading_prefix_cache
 
+    def deferred_by_same_step_hit(self, request_id: str) -> bool:
+        """True when the last allocate_slots refusal for this request was a Mamba
+        manager deferring it to the next step (the state block it would reuse is
+        being written in this step), not a shortage of free blocks."""
+        return any(
+            request_id in getattr(manager, "deferred_this_step", ())
+            for manager in self.coordinator.single_type_managers
+        )
+
     def record_prefix_cache_stats(self, request: Request, num_hits: int) -> None:
         # Don't count a request that skipped the cache lookup.
         if not self.log_stats or not self.prefix_cache_lookup_enabled(request):

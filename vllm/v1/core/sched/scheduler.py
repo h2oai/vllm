@@ -1268,12 +1268,18 @@ class Scheduler(SchedulerInterface):
                 )
 
                 if new_blocks is None:
-                    # The request cannot be scheduled.
-
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    if self.kv_cache_manager.deferred_by_same_step_hit(request_id):
+                        # A Mamba state block it would reuse is still being
+                        # written in this step: only this request waits for the
+                        # next step; the requests behind it can still run now.
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
+                    # The request cannot be scheduled: no free blocks.
                     break
 
                 # KVTransfer: the connector uses this info to determine

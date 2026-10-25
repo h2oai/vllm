@@ -1467,6 +1467,9 @@ class MambaManager(SingleTypeKVCacheManager):
         # Mamba checkpoints follow Eagle's global replay boundary.
         self.drop_eagle_checkpoint_block = False
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+        # requests refused this step because the state block they would reuse is
+        # being written in this step (see get_num_blocks_to_allocate)
+        self.deferred_this_step: set[str] = set()
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
             # allocated in the previous step
@@ -1729,7 +1732,9 @@ class MambaManager(SingleTypeKVCacheManager):
             # To put it in the next step, we return num_gpu_blocks + 1 so
             # that kv_cache_manager will think there is no enough blocks to allocate now
             # and don't schedule it in the current step.
+            self.deferred_this_step.add(request_id)
             return self.block_pool.num_gpu_blocks + 1
+        self.deferred_this_step.discard(request_id)
         if self.mamba_cache_mode != "align":
             # Allocate extra `num_speculative_blocks` blocks for
             # speculative decoding (MTP/EAGLE) with linear attention.
@@ -2034,6 +2039,7 @@ class MambaManager(SingleTypeKVCacheManager):
                     )
 
     def new_step_starts(self) -> None:
+        self.deferred_this_step.clear()
         self.cached_blocks_this_step.clear()
 
     def _cache_partial_tail_block(
