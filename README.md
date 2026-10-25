@@ -19,6 +19,15 @@ For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 
 ---
 
+## h2oai/vllm
+
+This fork is vLLM 0.30.0 with per-request attention: a request carrying
+`vllm_xargs {"attention_mode": "bidirectional"}` reads both ways on the same engine that serves ordinary requests.
+Wheels (CUDA 12.9 and 13.0) are on the [Releases](https://github.com/h2oai/vllm/releases) page and images on
+`ghcr.io/h2oai/vllm`; install steps, the build and the CI are in [tools/h2o/README.md](tools/h2o/README.md).
+
+---
+
 ## About
 
 vLLM is a fast and easy-to-use library for LLM inference and serving.

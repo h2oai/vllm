@@ -1,0 +1,28 @@
+# The h2oai/vllm image: the upstream vLLM OpenAI server image of the same release with the h2oai/vllm wheel
+# installed over it (the wheel carries the upstream binaries unchanged, so --no-deps keeps every other package).
+# Build context: a directory holding exactly one h2oai/vllm wheel of the matching CUDA variant.
+#
+#   docker build -f docker/Dockerfile.h2o --build-arg VARIANT=cu129 -t vllm-h2o:cu129 dist/
+#
+# VARIANT cu129 uses vllm/vllm-openai:v0.30.0-cu129, cu130 uses vllm/vllm-openai:v0.30.0.
+ARG VARIANT=cu129
+ARG BASE_IMAGE=vllm/vllm-openai:v0.30.0-cu129
+FROM ${BASE_IMAGE}
+ARG VARIANT
+
+COPY vllm-*.whl /tmp/h2o/
+RUN uv pip install --system --no-deps --reinstall /tmp/h2o/vllm-*.whl && rm -rf /tmp/h2o
+
+# vLLM 0.30.0 pins torch 2.13.0; the upstream v0.30.0-cu129 image ships torch 2.14.0 (a CUDA 13 build), with which
+# the CUDA 12.9 torchvision fails to load. Install the pinned builds for this variant (a no-op when they are there).
+RUN uv pip install --system "torch==2.13.0" "torchvision==0.28.0" "torchaudio==2.11.0" "torchcodec==0.16.0" \
+        --index-url "https://download.pytorch.org/whl/${VARIANT}" --extra-index-url https://pypi.org/simple \
+    && python3 -c "import importlib.metadata as m, torch, torchvision; \
+cuda = {'cu129': '12.9', 'cu130': '13.0'}['${VARIANT}']; \
+assert torch.__version__.startswith('2.13.0') and torch.version.cuda == cuda, (torch.__version__, torch.version.cuda); \
+torchvision.ops.nms; v = m.version('vllm'); assert '+h2o.' in v and v.endswith('.${VARIANT}'), v; \
+from vllm.v1.request import parse_attention_mode; print('vllm', v, 'torch', torch.__version__)"
+
+LABEL org.opencontainers.image.source="https://github.com/h2oai/vllm" \
+      org.opencontainers.image.description="vLLM 0.30.0 with per-request attention (h2oai/vllm)" \
+      org.opencontainers.image.licenses="Apache-2.0"

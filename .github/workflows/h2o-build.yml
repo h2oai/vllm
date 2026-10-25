@@ -1,0 +1,159 @@
+# h2oai/vllm build: wheels for CUDA 12.9 and 13.0 on GitHub-hosted CPU runners, an install smoke test of each, and on
+# an h2o-v* tag a GitHub Release with the wheels plus images on ghcr.io/h2oai/vllm. The fork changes Python files
+# only, so each wheel is this commit's Python over the compiled parts of the upstream v0.30.0 wheel
+# (tools/h2o/build_wheel.sh; tools/h2o/verify_wheel.py checks it file by file). See tools/h2o/README.md.
+name: h2o build
+
+on:
+  push:
+    branches: ["h2o/**"]
+    tags: ["h2o-v*"]
+    paths-ignore: ["docs/**", "**/*.md"]
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Also build and push the images to ghcr.io/h2oai/vllm"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: h2o-build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  wheel:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cu129, cu130]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build and verify the wheel
+        run: tools/h2o/build_wheel.sh ${{ matrix.variant }} dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.variant }}
+          path: |
+            dist/*.whl
+            dist/*.whl.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  smoke:
+    needs: wheel
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cu129, cu130]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-${{ matrix.variant }}
+          path: dist
+      - name: Install the wheel and run the CPU tests
+        run: tools/h2o/smoke.sh ${{ matrix.variant }} dist/vllm-*.whl
+
+  image:
+    needs: smoke
+    if: startsWith(github.ref, 'refs/tags/h2o-v') || inputs.image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: cu129
+            base: vllm/vllm-openai:v0.30.0-cu129
+          - variant: cu130
+            base: vllm/vllm-openai:v0.30.0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-${{ matrix.variant }}
+          path: dist
+      - name: Disk space for the CUDA base image (~31 GB unpacked; the result is ~40 GB)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          # docker's storage on the runner's larger /mnt disk
+          sudo systemctl stop docker docker.socket
+          sudo mkdir -p /mnt/docker
+          echo '{"data-root": "/mnt/docker"}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl start docker
+          df -h / /mnt
+      - name: Image tags
+        id: tags
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          wheel="$(basename dist/vllm-*.whl)"
+          version="$(echo "$wheel" | cut -d- -f2 | tr '+' '-')"  # 0.30.0-h2o.<sha>.<variant>
+          tags="$image:$version"
+          if [[ "$GITHUB_REF" == refs/tags/h2o-v* ]]; then
+            tags="$tags,$image:${GITHUB_REF_NAME#h2o-v}-${{ matrix.variant }}"
+          fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: dist
+          file: docker/Dockerfile.h2o
+          build-args: |
+            VARIANT=${{ matrix.variant }}
+            BASE_IMAGE=${{ matrix.base }}
+          tags: ${{ steps.tags.outputs.tags }}
+          push: true
+
+  release:
+    needs: smoke
+    if: startsWith(github.ref, 'refs/tags/h2o-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - name: Release notes
+        run: |
+          {
+            echo "vLLM ${GITHUB_REF_NAME#h2o-v} from h2oai/vllm commit ${GITHUB_SHA}: upstream vLLM 0.30.0 with"
+            echo "per-request attention. The wheels reuse the upstream v0.30.0 binaries unchanged; only Python files differ."
+            echo
+            echo '```bash'
+            echo "# the CUDA 12.9 build; the .cu130 wheel (CUDA 13.0) installs the same way from the cu130 index"
+            echo "pip install torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 torchcodec==0.16.0 --index-url https://download.pytorch.org/whl/cu129"
+            echo "pip install https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/$(cd dist && ls *.cu129-*.whl | sed 's/+/%2B/') --extra-index-url https://flashinfer.ai/whl/"
+            echo '```'
+            echo
+            echo "sha256:"
+            echo '```'
+            cat dist/*.sha256
+            echo '```'
+          } > notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          files: |
+            dist/*.whl
+            dist/*.whl.sha256
