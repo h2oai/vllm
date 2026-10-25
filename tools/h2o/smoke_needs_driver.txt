@@ -1,0 +1,13 @@
+# Fork CPU tests that need vLLM to detect a platform, which takes an NVIDIA driver (no GPU has to be visible).
+# smoke.sh leaves these out on a machine without one, such as a GitHub-hosted runner.
+tests/v1/core/test_per_request_attention.py::test_scheduled_whole_or_deferred_and_too_long_is_an_error
+tests/v1/core/test_per_request_attention.py::test_the_long_prefill_threshold_never_splits_a_bidirectional_prompt
+tests/v1/core/test_per_request_attention.py::test_the_static_step_cap_counts_the_draft_slots
+tests/v1/core/test_per_request_attention.py::test_an_encoder_split_defers_and_a_never_fitting_encoder_input_errors
+tests/v1/core/test_per_request_attention.py::test_a_deferred_bidirectional_prompt_ages_and_holds_admission
+tests/v1/core/test_per_request_attention.py::test_deferred_two_way_reads_release_their_encoder_references
+tests/v1/core/test_per_request_attention.py::test_an_encoder_split_deferral_holds_no_admission
+tests/models/test_gemma4_noncausal_inert.py::test_no_declaration_builds_the_stock_layers[e4b]
+tests/models/test_gemma4_noncausal_inert.py::test_no_declaration_builds_the_stock_layers[31b]
+tests/models/test_gemma4_noncausal_inert.py::test_declaration_switches_exactly_the_full_layers
+tests/models/test_gemma4_noncausal_inert.py::test_inert_forward_takes_the_stock_calls

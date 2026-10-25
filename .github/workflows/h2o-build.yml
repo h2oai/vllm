@@ -8,7 +8,6 @@ on:
   push:
     branches: ["h2o/**"]
     tags: ["h2o-v*"]
-    paths-ignore: ["docs/**", "**/*.md"]
   workflow_dispatch:
     inputs:
       image:

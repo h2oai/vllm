@@ -51,4 +51,5 @@ docker build -f docker/Dockerfile.h2o --build-arg VARIANT=cu129 \
   sha256, and images `ghcr.io/h2oai/vllm:<version>-cu129` / `-cu130`;
 - manual run (`workflow_dispatch`, `image: true`): the images without a release.
 
-The GPU tests of the fork (`tests/models/**/test_gemma4_*`, marked to skip without a CUDA GPU) are not run in CI.
+On a runner without an NVIDIA driver the smoke test leaves out the CPU tests listed in `smoke_needs_driver.txt`
+(they need vLLM to detect a platform); with a driver it runs them all. The GPU tests of the fork (`tests/models/**/test_gemma4_*`, marked to skip without a CUDA GPU) are not run in CI.

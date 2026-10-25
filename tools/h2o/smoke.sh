@@ -52,4 +52,17 @@ for t in tests/v1/core/test_per_request_attention.py tests/v1/worker/test_per_re
   [ -f "$WORK/$t" ] && TESTS+=("$t")
 done
 [ "${#TESTS[@]}" -gt 0 ] || { echo "no fork tests found"; exit 1; }
-"$VPY" -m pytest -q -rs -p no:cacheprovider "${TESTS[@]}"
+# without an NVIDIA driver vLLM detects no platform, and the tests that build a scheduler or a model config need one:
+# leave out the ones listed in smoke_needs_driver.txt there (with a driver, even with no GPU visible, all run)
+DESELECT=()
+PLATFORM="$("$VPY" -I -c 'from vllm.platforms import current_platform as p; print(p.device_type or "")' 2>/dev/null)" || true
+if [ -z "$PLATFORM" ]; then
+  while read -r id; do
+    case "$id" in ''|'#'*) continue;; esac
+    [ -f "$WORK/${id%%::*}" ] && DESELECT+=(--deselect "$id")
+  done < "$HERE/smoke_needs_driver.txt"
+  echo "smoke: no platform detected (no NVIDIA driver): deselecting $(( ${#DESELECT[@]} / 2 )) tests from smoke_needs_driver.txt"
+else
+  echo "smoke: platform ${PLATFORM}: running every test"
+fi
+"$VPY" -m pytest -q -rs -p no:cacheprovider "${DESELECT[@]}" "${TESTS[@]}"
