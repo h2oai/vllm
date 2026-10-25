@@ -22,6 +22,10 @@ bucket) for a token bucket B >= the step's T tokens, on static buffers:
   once), and the chunk index list with chunks past the last sequence's end
   (fully masked). As a second guard the pad rows also get zero conv output and
   a = b = -inf (g = 0, beta = 0: identity steps of the recurrence).
+* the sequence count is rounded up to 1, 2, 4, 8 or 16 (fewer graphs to
+  capture under load): the extra sequences are empty (cu_seqlens repeats the
+  end), start from no state and point at the null state block, which no
+  request owns (the Triton/FLA kernels write a zero final state there).
 * FlashInfer's SM90 kernel picks a chunk-parallel split on the host from the
   row count. A graph is used only when the split for B equals the split the
   eager call would pick for T (then it is bit-exact too); else the 64-row
@@ -49,12 +53,17 @@ import torch
 
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 logger = init_logger(__name__)
 
 # 64 * 1.5^k-ish buckets: at most ~1.5x padding of the GDN rows (the GDN
 # kernels are a small part of a short prefill, so padding is cheap there).
 _BUCKETS = (64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096)
+
+
+# graph sequence counts: a step's prefill count is rounded up to one of these
+_SEQ_BUCKETS = (1, 2, 4, 8, 16, 32, 64)
 
 
 # the conv1d kernel's BLOCK_M (tokens per program), as in
@@ -100,6 +109,7 @@ class GDNPrefillGraphs:
         self._step_metadata = None  # the step's metadata object, compared by `is`
         self._step_bucket: _Bucket | None = None
         self.disabled_reason: str | None = None
+        self._shapes_seen: set[tuple[int, int]] = set()
 
     # ------------------------------------------------------------------
     def bucket_size(self, num_tokens: int) -> int | None:
@@ -110,11 +120,22 @@ class GDNPrefillGraphs:
                 return b
         return None
 
+    def seq_bucket(self, num_seqs: int) -> int | None:
+        for n in _SEQ_BUCKETS:
+            if n > self.max_seqs:
+                return None
+            if num_seqs <= n:
+                return n
+        return None
+
     def graph_size(self, layer, num_tokens: int, num_seqs: int = 1) -> int | None:
-        """The bucket to replay for N sequences of T tokens in all, or None
-        (run eagerly)."""
+        """The token bucket to replay for N sequences of T tokens in all, or
+        None (run eagerly)."""
         size = self.bucket_size(num_tokens)
-        if size is None or layer.gdn_prefill_backend != "flashinfer":
+        graph_seqs = self.seq_bucket(num_seqs)
+        if size is None or graph_seqs is None:
+            return None
+        if layer.gdn_prefill_backend != "flashinfer":
             return size
         heads = layer.num_v_heads // layer.tp_size
         key = (heads, num_tokens, num_seqs)
@@ -125,7 +146,7 @@ class GDNPrefillGraphs:
                 for b in (size, -(-num_tokens // 64) * 64):
                     if (
                         b <= self.max_tokens
-                        and _flashinfer_plan(b, heads, num_seqs) == want
+                        and _flashinfer_plan(b, heads, graph_seqs) == want
                     ):
                         choice = b
                         break
@@ -135,7 +156,8 @@ class GDNPrefillGraphs:
     def eligible(self, layer, md) -> bool:
         return (
             md is not None
-            and 1 <= md.num_prefills <= self.max_seqs
+            and md.num_prefills >= 1
+            and self.seq_bucket(md.num_prefills) is not None
             and md.num_decodes == 0
             and md.spec_sequence_masks is None
             and md.num_spec_decodes == 0
@@ -167,10 +189,11 @@ class GDNPrefillGraphs:
         if not out.is_cuda or torch.cuda.is_current_stream_capturing():
             return False
         num_tokens = md.num_actual_tokens
-        num_seqs = md.num_prefills
-        size = self.graph_size(layer, num_tokens, num_seqs)
+        size = self.graph_size(layer, num_tokens, md.num_prefills)
         if size is None:
             return False
+        num_seqs = self.seq_bucket(md.num_prefills)
+        assert num_seqs is not None
 
         if md is not self._step_metadata:
             bucket = self._bucket(num_seqs, size, out.device)
@@ -208,6 +231,16 @@ class GDNPrefillGraphs:
                 return False
             self.graphs[key] = graph
             self._graph_buffers[key] = _library_scratch_buffers()
+            if (num_seqs, size) not in self._shapes_seen:
+                self._shapes_seen.add((num_seqs, size))
+                logger.info(
+                    "GDN prefill CUDA graphs: first capture for %d sequences, "
+                    "bucket %d (%d shapes, %d graphs so far)",
+                    num_seqs,
+                    size,
+                    len(self._shapes_seen),
+                    len(self.graphs),
+                )
         graph.replay()
         out[:num_tokens].copy_(static_out[:num_tokens])
         return True
@@ -242,10 +275,17 @@ class GDNPrefillGraphs:
         )
         from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 
-        n = bucket.num_seqs
-        bucket.query_start_loc.copy_(md.non_spec_query_start_loc[: n + 1])
-        bucket.state_slot.copy_(md.prefill_state_indices[:n])
-        bucket.has_initial_state.copy_(md.prefill_has_initial_state[:n])
+        n = bucket.num_seqs  # graph sequences; the first m are real
+        m = md.num_prefills
+        cu = md.non_spec_query_start_loc
+        bucket.query_start_loc[: m + 1].copy_(cu[: m + 1])
+        bucket.state_slot[:m].copy_(md.prefill_state_indices[:m])
+        bucket.has_initial_state[:m].copy_(md.prefill_has_initial_state[:m])
+        if m < n:
+            # empty sequences: no rows, no state in, the null block's slot out
+            bucket.query_start_loc[m + 1 :] = cu[m]
+            bucket.state_slot[m:] = NULL_BLOCK_ID
+            bucket.has_initial_state[m:] = False
         if n == 1:
             # one sequence: the static chunk list and conv program map of the
             # whole bucket serve every length (see _bucket)
@@ -256,17 +296,19 @@ class GDNPrefillGraphs:
         cu_cpu = md.prefill_query_start_loc_cpu
         chunks = prepare_chunk_indices(cu_cpu, FLA_CHUNK_SIZE)
         num_chunks = chunks.shape[0]
-        # pad the chunk list with chunks past the end of the last sequence:
-        # their loads and stores are fully masked, and their per-sequence chunk
-        # numbers stay inside the (max_chunks) workspace
-        last_chunks = -(-int(cu_cpu[n] - cu_cpu[n - 1]) // FLA_CHUNK_SIZE)
+        # pad the chunk list with chunks past the end of the last real
+        # sequence: their loads and stores are fully masked, and their
+        # per-sequence chunk numbers stay inside the (max_chunks) workspace
+        last_chunks = -(-int(cu_cpu[m] - cu_cpu[m - 1]) // FLA_CHUNK_SIZE)
         tail = max_chunks - num_chunks
         padded = torch.empty((max_chunks, 2), dtype=torch.int32, pin_memory=True)
         padded[:num_chunks] = chunks
-        padded[num_chunks:, 0] = n - 1
+        padded[num_chunks:, 0] = m - 1
         padded[num_chunks:, 1] = torch.arange(last_chunks, last_chunks + tail)
         bucket.chunk_indices.copy_(padded, non_blocking=True)
-        bucket.chunk_offsets.copy_(md.chunk_offsets[: n + 1])
+        bucket.chunk_offsets[: m + 1].copy_(md.chunk_offsets[: m + 1])
+        if m < n:
+            bucket.chunk_offsets[m + 1 :] = md.chunk_offsets[m]
         # the builder's program map is PAD_SLOT_ID past its real programs
         bucket.conv_batch_ptr.copy_(md.batch_ptr[:max_programs])
         bucket.conv_chunk_offset_ptr.copy_(md.token_chunk_offset_ptr[:max_programs])

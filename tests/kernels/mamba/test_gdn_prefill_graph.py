@@ -24,6 +24,14 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.mamba.gdn.prefill_graph import GDNPrefillGraphs
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+
+def test_seq_bucket() -> None:
+    g = GDNPrefillGraphs(max_tokens=2048, max_seqs=16)
+    assert [g.seq_bucket(n) for n in (1, 2, 3, 5, 8, 9, 16)] == [1, 2, 4, 8, 8, 16, 16]
+    assert g.seq_bucket(17) is None
+    assert GDNPrefillGraphs(max_tokens=2048, max_seqs=4).seq_bucket(5) is None
 
 
 def test_bucket_size() -> None:
@@ -221,6 +229,7 @@ CASES = [
     ([117, 5, 64], [0, 32, 0]),
     ([30] * 6, [0] * 6),
     ([200, 100, 2, 7], [0, 16, 0, 64]),
+    ([20, 33, 9, 70, 12], [0, 8, 0, 0, 40]),
 ]
 
 
@@ -288,7 +297,15 @@ def test_prefill_graph_matches_eager(backend, state_dtype, query_lens, cached):
         n = num_tokens
         torch.testing.assert_close(conv_g, conv_e, atol=0, rtol=0)
         torch.testing.assert_close(out_g[:n], out_e[:n], atol=0, rtol=0)
-        torch.testing.assert_close(ssm_g, ssm_e, atol=0, rtol=0)
+        if graphs.seq_bucket(len(query_lens)) == len(query_lens):
+            torch.testing.assert_close(ssm_g, ssm_e, atol=0, rtol=0)
+        else:
+            # the empty pad sequences may write their (zero) final state to the
+            # null block, which no request owns; every other slot must be
+            # identical
+            slots = meta.prefill_state_indices.tolist()
+            assert NULL_BLOCK_ID not in slots
+            torch.testing.assert_close(ssm_g[1:], ssm_e[1:], atol=0, rtol=0)
     assert len(graphs.graphs) == 1
 
 
