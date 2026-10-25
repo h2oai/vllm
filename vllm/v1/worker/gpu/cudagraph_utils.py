@@ -523,12 +523,21 @@ class CudaGraphManager:
         num_active_loras: int,
         max_query_len: int | None = None,
         num_ubatches: int = 1,
+        no_full: bool = False,
     ) -> BatchExecutionDescriptor:
-        """Find matching cudagraph descriptor from priority-ordered candidates."""
+        """Find matching cudagraph descriptor from priority-ordered candidates.
+
+        ``no_full`` skips FULL graphs (they bake in the attention kernels'
+        capture-time arguments); PIECEWISE graphs still match, since they run
+        attention eagerly between the captured pieces.
+        """
+
         effective_loras = self._resolve_effective_loras(num_active_loras)
         key = (num_tokens, effective_loras)
         if self._graphs_captured and num_tokens > 0 and key in self._candidates:
             for desc in self._candidates[key]:
+                if no_full and desc.cg_mode == CUDAGraphMode.FULL:
+                    continue
                 if _is_compatible(
                     desc,
                     num_reqs,

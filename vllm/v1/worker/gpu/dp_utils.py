@@ -224,6 +224,7 @@ def dispatch_cg_and_sync_dp(
     allow_ubatching: bool = False,
     uniform_decode: bool = False,
     dp_sync_state: DPSyncState | None = None,
+    no_full: bool = False,
 ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
     """Pick a cudagraph descriptor for this batch, agreeing it across DP ranks.
 
@@ -246,6 +247,9 @@ def dispatch_cg_and_sync_dp(
             varlen decode graphs. None, as for a batch with a prefill, keeps
             the batch out of graphs that constrain it.
         need_eager: Force `CUDAGraphMode.NONE` instead of dispatching.
+        no_full: Never pick a FULL graph (PIECEWISE or NONE only). With
+            dp_size > 1 the batch runs eagerly instead, so the ranks' graph
+            modes cannot disagree.
         num_active_loras: Active LoRA count for this rank. Does not need
             cross-rank agreement; it never changes a bucket's token count.
         parallel_config: Only needed to decide whether to microbatch, so
@@ -266,6 +270,8 @@ def dispatch_cg_and_sync_dp(
 
     """
     reuse_eager = dp_sync_state is not None and dp_sync_state.eager
+    if no_full and dp_size > 1:
+        need_eager = True
 
     if need_eager or reuse_eager:
         batch_desc = BatchExecutionDescriptor(
@@ -285,6 +291,7 @@ def dispatch_cg_and_sync_dp(
             dp_sync_state.uniform_token_count if dp_sync_state else uniform_token_count,
             num_active_loras=num_active_loras,
             max_query_len=max_query_len,
+            no_full=no_full,
         )
 
     if dp_size == 1:
