@@ -57,6 +57,19 @@ def test_language_model_only_affects_model_hash():
     assert base_hash != lm_only_hash
 
 
+def test_zero_mm_limit_affects_model_hash():
+    """A zero --limit-mm-per-prompt skips that modality's tower, like
+    language_model_only, so a compiled graph from an images-off start must not
+    be reused by an images-on start (the AOT cache loaded it and the first
+    forward failed). Non-zero limits share one hash."""
+    model = "Qwen/Qwen3.5-4B"
+    image4 = ModelConfig(model, limit_mm_per_prompt={"image": 4}).compute_hash()
+    image16 = ModelConfig(model, limit_mm_per_prompt={"image": 16}).compute_hash()
+    image0 = ModelConfig(model, limit_mm_per_prompt={"image": 0}).compute_hash()
+    assert image4 == image16
+    assert image4 != image0
+
+
 @pytest.mark.parametrize("backend_arg", ["video_backend", "backend"])
 def test_use_gpu_video_backend_from_media_io_kwargs(backend_arg: str):
     config = MultiModalConfig(

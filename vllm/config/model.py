@@ -475,6 +475,16 @@ class ModelConfig:
         # here early.
         if self.multimodal_config:
             factors["language_model_only"] = self.multimodal_config.language_model_only
+            # A modality whose --limit-mm-per-prompt is 0 has its tower skipped
+            # (_mark_tower_model), which changes the model as much as
+            # language_model_only does; a compiled graph from such a start must
+            # not be loaded for a start that reads that modality. Only the zero
+            # / non-zero state matters, so other limit changes keep the cache.
+            factors["mm_zero_limit_modalities"] = sorted(
+                modality
+                for modality in self.multimodal_config.limit_per_prompt
+                if self.multimodal_config.get_limit_per_prompt(modality) == 0
+            )
         return hash_factors(factors)
 
     def _update_nested(
