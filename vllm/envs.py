@@ -129,6 +129,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
     VLLM_GDN_PREFILL_GRAPH_MAX_TOKENS: int = 2048
+    VLLM_GDN_PREFILL_GRAPH_MAX_SEQS: int = 16
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -1214,6 +1215,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # model_executor/layers/mamba/gdn/prefill_graph.py); 0 disables.
     "VLLM_GDN_PREFILL_GRAPH_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_GDN_PREFILL_GRAPH_MAX_TOKENS", "2048")
+    ),
+    # Most prefills in one step that still replay the GDN prefill CUDA graphs
+    # (one graph set per sequence count); 1 = single-sequence prefills only.
+    "VLLM_GDN_PREFILL_GRAPH_MAX_SEQS": lambda: int(
+        os.getenv("VLLM_GDN_PREFILL_GRAPH_MAX_SEQS", "16")
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (

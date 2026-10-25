@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The GDN prefill CUDA graph (gdn/prefill_graph.py) against the eager path.
 
-A single-sequence prefill of T tokens runs once through the real eager
-``_forward_core`` and once through ``gdn_prefill_graphs.run``, which replays a
-graph captured for the bucket B >= T. The core-attention output of the T real
+A prefill-only step (one or several sequences, T tokens in all) runs once
+through the real eager ``_forward_core`` and once through
+``gdn_prefill_graphs.run``, which replays a graph captured for N sequences and
+the bucket B >= T. The core-attention output of the T real
 rows, the conv-state pool and the ssm-state pool must be bit-identical (the
 graph's kernels read T from the device). Both a fresh prefill and one that
 continues from a cached state are checked, the second replay of a captured
@@ -46,6 +47,10 @@ def _md(**kw):
         graph_pad_rows=None,
         prefill_state_indices=object(),
         prefill_has_initial_state=object(),
+        prefill_query_start_loc_cpu=object(),
+        chunk_offsets=object(),
+        batch_ptr=object(),
+        token_chunk_offset_ptr=object(),
     )
     base.update(kw)
     return types.SimpleNamespace(**base)
@@ -55,7 +60,11 @@ def _md(**kw):
     "kw,ok",
     [
         ({}, True),
-        ({"num_prefills": 2}, False),
+        ({"num_prefills": 2}, True),
+        ({"num_prefills": 4}, True),
+        ({"num_prefills": 5}, False),
+        ({"prefill_query_start_loc_cpu": None}, False),
+        ({"batch_ptr": None}, False),
         ({"num_decodes": 1}, False),
         ({"num_spec_decodes": 1}, False),
         ({"spec_sequence_masks": object()}, False),
@@ -64,11 +73,12 @@ def _md(**kw):
     ],
 )
 def test_eligible(kw, ok) -> None:
+    g = GDNPrefillGraphs(max_tokens=2048, max_seqs=4)
     layer = types.SimpleNamespace(gdn_prefill_backend="triton")
-    assert GDNPrefillGraphs.eligible(layer, _md(**kw)) is ok
-    assert GDNPrefillGraphs.eligible(layer, None) is False
+    assert g.eligible(layer, _md(**kw)) is ok
+    assert g.eligible(layer, None) is False
     layer.gdn_prefill_backend = "cutedsl"
-    assert GDNPrefillGraphs.eligible(layer, _md()) is False
+    assert g.eligible(layer, _md()) is False
 
 
 def test_flashinfer_size_follows_plan(monkeypatch) -> None:
@@ -78,7 +88,7 @@ def test_flashinfer_size_follows_plan(monkeypatch) -> None:
     monkeypatch.setattr(
         prefill_graph,
         "_flashinfer_plan",
-        lambda rows, heads: ("cp", 192 if rows < 600 else 256),
+        lambda rows, heads, seqs=1: ("cp", 192 if rows < 600 else 256),
     )
     layer = types.SimpleNamespace(
         gdn_prefill_backend="flashinfer", num_v_heads=32, tp_size=1
@@ -87,7 +97,9 @@ def test_flashinfer_size_follows_plan(monkeypatch) -> None:
     assert g.bucket_size(514) == 768
     assert g.graph_size(layer, 514) == 576  # the 64-row bucket keeps the plan
     assert g.graph_size(layer, 600) == 768
-    monkeypatch.setattr(prefill_graph, "_flashinfer_plan", lambda rows, heads: None)
+    monkeypatch.setattr(
+        prefill_graph, "_flashinfer_plan", lambda rows, heads, seqs=1: None
+    )
     assert GDNPrefillGraphs(max_tokens=2048).graph_size(layer, 514) is None
     layer.gdn_prefill_backend = "triton"
     assert g.graph_size(layer, 514) == 768
@@ -199,11 +211,24 @@ def _run(layer, meta, fn, n_rows, inputs):
     return out, used
 
 
+CASES = [
+    # (query lengths, cached context per sequence)
+    ([117], [0]),
+    ([64], [0]),
+    ([300], [0]),
+    ([90], [48]),
+    ([40, 50], [0, 0]),
+    ([117, 5, 64], [0, 32, 0]),
+    ([30] * 6, [0] * 6),
+    ([200, 100, 2, 7], [0, 16, 0, 64]),
+]
+
+
 @needs_gpu
 @pytest.mark.parametrize("backend", ["triton", "flashinfer"])
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("num_tokens,cached", [(117, 0), (64, 0), (300, 0), (90, 48)])
-def test_prefill_graph_matches_eager(backend, state_dtype, num_tokens, cached):
+@pytest.mark.parametrize("query_lens,cached", CASES)
+def test_prefill_graph_matches_eager(backend, state_dtype, query_lens, cached):
     if backend == "flashinfer" and not current_platform.is_device_capability(90):
         pytest.skip("FlashInfer GDN prefill runs on SM90 here")
     from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -212,11 +237,11 @@ def test_prefill_graph_matches_eager(backend, state_dtype, num_tokens, cached):
 
     torch.manual_seed(0)
     cfg, device, builder, make_layer = _setup(backend)
-    graphs = GDNPrefillGraphs(max_tokens=2048)
+    graphs = GDNPrefillGraphs(max_tokens=2048, max_seqs=16)
     conv_shape, ssm_shape = MambaStateShapeCalculator.gated_delta_net_state_shape(
         1, H, HV, K, V, CONV_KERNEL, num_spec=0
     )
-    pool = 64
+    pool = 128
     conv0 = torch.randn(pool, *conv_shape, dtype=torch.bfloat16, device=device) * 0.05
     ssm0 = torch.randn(pool, *ssm_shape, dtype=state_dtype, device=device) * 0.05
     params = (
@@ -234,10 +259,12 @@ def test_prefill_graph_matches_eager(backend, state_dtype, num_tokens, cached):
     def graph(layer, out, mixed_qkv, b, a):
         return graphs.run(layer, layer._forward_core, (mixed_qkv, b, a), out)
 
-    # three steps: capture, replay with new inputs, replay with a longer context
+    num_tokens = sum(query_lens)
+    # three steps: capture, replay with new inputs, replay with longer contexts
     for step, extra in enumerate((0, 0, 16)):
-        ctx_len = cached + extra
-        meta = _meta(cfg, builder, device, [ctx_len + num_tokens], [num_tokens])
+        seq_lens = [c + extra + q for c, q in zip(cached, query_lens)]
+        meta = _meta(cfg, builder, device, seq_lens, query_lens)
+        assert meta.num_prefills == len(query_lens) and meta.num_decodes == 0
         # vLLM pads the step's token count; the GDN core sees the padded rows
         n_rows = num_tokens + 5
         inputs = (
@@ -266,14 +293,18 @@ def test_prefill_graph_matches_eager(backend, state_dtype, num_tokens, cached):
 
 
 @needs_gpu
-def test_two_prefills_take_eager_path():
+def test_decodes_or_too_many_prefills_take_eager_path():
     torch.manual_seed(0)
     cfg, device, builder, make_layer = _setup("triton")
-    graphs = GDNPrefillGraphs(max_tokens=2048)
-    meta = _meta(cfg, builder, device, [40, 50], [40, 50])
-    layer = types.SimpleNamespace(
-        gdn_prefill_backend="triton",
-        _layer_attn_metadata=lambda: meta,
-    )
-    assert not graphs.run(layer, None, (), torch.zeros(1, device=device))
-    assert not graphs.graphs
+    for max_seqs, seq_lens, query_lens in (
+        (16, [40, 50], [1, 50]),  # a decode in the step
+        (2, [40, 50, 60], [40, 50, 60]),  # more prefills than max_seqs
+    ):
+        graphs = GDNPrefillGraphs(max_tokens=2048, max_seqs=max_seqs)
+        meta = _meta(cfg, builder, device, seq_lens, query_lens)
+        layer = types.SimpleNamespace(
+            gdn_prefill_backend="triton",
+            _layer_attn_metadata=lambda meta=meta: meta,
+        )
+        assert not graphs.run(layer, None, (), torch.zeros(1, device=device))
+        assert not graphs.graphs
