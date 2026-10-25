@@ -78,6 +78,13 @@ class GDNAttentionMetadata:
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
 
+    # Set only on the static metadata of a GDN prefill CUDA graph (see
+    # gdn/prefill_graph.py): True for the rows past the sequence's real tokens,
+    # which the graph pads to its bucket size. Those rows get zero conv output
+    # and identity gating (g = 0, beta = 0), so they leave the recurrent state
+    # unchanged.
+    graph_pad_rows: torch.Tensor | None = None
+
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
     kv_cache_spec: MambaSpec

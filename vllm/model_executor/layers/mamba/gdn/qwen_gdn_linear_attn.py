@@ -30,6 +30,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
+from vllm.model_executor.layers.mamba.gdn.prefill_graph import gdn_prefill_graphs
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
@@ -1265,12 +1266,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out,
         )
 
+    def _layer_attn_metadata(self) -> GDNAttentionMetadata | None:
+        attn_metadata_raw = get_forward_context().attn_metadata
+        if isinstance(attn_metadata_raw, dict):
+            return attn_metadata_raw.get(self.prefix)
+        return None
+
     def _forward_core(
         self,
         mixed_qkv: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
         core_attn_out: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata | None = None,
     ):
         """Core conv1d + recurrent attention (standard path).
 
@@ -1279,16 +1287,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             b: beta gating vector                   (num_tokens, num_heads)
             a: alpha gating vector                  (num_tokens, num_heads)
             core_attn_out: Pre-allocated output buffer for attention results.
+            attn_metadata: this layer's metadata; looked up in the forward
+                context when None (a prefill CUDA graph passes its own).
         """
-        forward_context = get_forward_context()
-        attn_metadata_raw = forward_context.attn_metadata
-
-        attn_metadata = None
-        if isinstance(attn_metadata_raw, dict):
-            attn_metadata = attn_metadata_raw.get(self.prefix)
         if attn_metadata is None:
-            self._warmup_prefill_kernels(mixed_qkv, 0)
-            return
+            attn_metadata = self._layer_attn_metadata()
+            if attn_metadata is None:
+                self._warmup_prefill_kernels(mixed_qkv, 0)
+                return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
 
@@ -1431,6 +1437,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 conv_output_prefill = mixed_qkv_non_spec
                 a_prefill = a_non_spec
                 b_prefill = b_non_spec
+            pad_rows = attn_metadata.graph_pad_rows
+            if pad_rows is not None:
+                # Prefill CUDA graph: the rows past the real tokens get zero
+                # conv output and a = b = -inf, i.e. g = 0 and beta = 0, so
+                # they leave the recurrent state exactly as the real tokens
+                # left it.
+                conv_output_prefill = conv_output_prefill.masked_fill(
+                    pad_rows[:, None], 0.0
+                )
+                a_prefill = a_prefill.masked_fill(pad_rows[:, None], float("-inf"))
+                b_prefill = b_prefill.masked_fill(pad_rows[:, None], float("-inf"))
 
             (
                 query_non_spec,
@@ -1524,7 +1541,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert prefill_state_indices is not None
             assert prefill_has_initial_state is not None
             initial_state = ssm_state[prefill_state_indices]
-            initial_state[~prefill_has_initial_state, ...] = 0
+            # Zero the rows without a cached state without a boolean-mask
+            # index_put: that calls nonzero() and syncs the GPU in every GDN
+            # layer, so the host can no longer run ahead of the kernels.
+            # torch.where, not a multiply: a stale slot holding inf/NaN times
+            # 0 would be NaN.
+            initial_state = torch.where(
+                prefill_has_initial_state.view(-1, *([1] * (initial_state.dim() - 1))),
+                initial_state,
+                0.0,
+            )
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -1795,16 +1821,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         mixed_qkvz: torch.Tensor,
         ba: torch.Tensor,
         core_attn_out: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata | None = None,
     ) -> None:
-        forward_context = get_forward_context()
-        attn_metadata_raw = forward_context.attn_metadata
         qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
-        attn_metadata = None
-        if isinstance(attn_metadata_raw, dict):
-            attn_metadata = attn_metadata_raw.get(self.prefix)
         if attn_metadata is None:
-            self._warmup_prefill_kernels(mixed_qkvz[:, :qkv_size], 0)
-            return
+            attn_metadata = self._layer_attn_metadata()
+            if attn_metadata is None:
+                self._warmup_prefill_kernels(mixed_qkvz[:, :qkv_size], 0)
+                return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
         mixed_qkv, output_gate_flat = mixed_qkvz.split(
@@ -1820,6 +1844,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             a=a,
             output_gate=output_gate,
             core_attn_out=core_attn_out,
+            attn_metadata=attn_metadata,
         )
 
     def _can_use_fused_gdn_mtp_decode(
@@ -1880,15 +1905,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         a: torch.Tensor,
         output_gate: torch.Tensor,
         core_attn_out: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata | None = None,
     ) -> None:
-        forward_context = get_forward_context()
-        attn_metadata_raw = forward_context.attn_metadata
-        attn_metadata = None
-        if isinstance(attn_metadata_raw, dict):
-            attn_metadata = attn_metadata_raw.get(self.prefix)
         if attn_metadata is None:
-            self._warmup_prefill_kernels(mixed_qkv, 0)
-            return
+            attn_metadata = self._layer_attn_metadata()
+            if attn_metadata is None:
+                self._warmup_prefill_kernels(mixed_qkv, 0)
+                return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
         if (
@@ -1909,6 +1932,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             b=b.contiguous(),
             a=a.contiguous(),
             core_attn_out=core_attn_out,
+            attn_metadata=attn_metadata,
         )
         num_actual_tokens = attn_metadata.num_actual_tokens
         self._rms_norm_gated_cuda(
@@ -1943,6 +1967,10 @@ def qwen_gdn_attention_core(
     layer_name = _resolve_layer_name(layer_name)
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
+    if not use_aiter and gdn_prefill_graphs.run(
+        self, self._forward_core, (qkv_or_qkvz, b_or_ba, a_or_z_out), core_attn_out
+    ):
+        return
     if use_aiter:
         self._forward_core_rocm(
             qkvz=qkv_or_qkvz,
@@ -1976,6 +2004,10 @@ def qwen_gdn_attention_core_fused_norm_packed(
     layer_name = _resolve_layer_name(layer_name)
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
+    if gdn_prefill_graphs.run(
+        self, self._forward_core_fused_norm_packed, (mixed_qkvz, ba), core_attn_out
+    ):
+        return
     self._forward_core_fused_norm_packed(
         mixed_qkvz=mixed_qkvz,
         ba=ba,
