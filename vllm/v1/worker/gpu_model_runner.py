@@ -207,6 +207,7 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
 from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
+from vllm import h2o_exits
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
@@ -3957,6 +3958,71 @@ class GPUModelRunner(
         finally:
             self.prepare_inputs_event.record()
 
+    # ---- H2O early exit (vllm/h2o_exits.py) -------------------------------
+    def _h2o_policy(self, req_state):
+        if not hasattr(req_state, "h2o_exit_policy"):
+            req_state.h2o_exit_policy = h2o_exits.parse_exit_policy(
+                req_state.sampling_params
+            )
+        return req_state.h2o_exit_policy
+
+    def _h2o_exit_step(self, scheduler_output, logits_indices, num_reqs):
+        """v1 batch rule: an exit step only when every request in the batch has
+        an exit policy, finishes its prefill now, and has label token ids."""
+        h2o_exits.STEP = None
+        heads = h2o_exits.HEADS
+        if heads is None or num_reqs == 0 or logits_indices is None:
+            return None
+        label_ids, temps, depths = [], [], []
+        for i, rid in enumerate(self.input_batch.req_ids[:num_reqs]):
+            rs = self.requests[rid]
+            pol = self._h2o_policy(rs)
+            if pol is None or rs.sampling_params is None:
+                return None
+            ids = rs.sampling_params.logprob_token_ids
+            done = (
+                int(self.input_batch.num_computed_tokens_cpu[i])
+                + scheduler_output.num_scheduled_tokens[rid]
+                >= rs.num_prompt_tokens
+            )
+            if not ids or not done:
+                return None
+            ks = heads.auto if pol["depths"] == "auto" else pol["depths"]
+            ks = [k for k in ks if k in heads.layers]
+            if not ks:
+                return None
+            label_ids.append(list(ids))
+            temps.append(pol["temp"])
+            depths.append((ks, pol["tau"]))
+        dev = logits_indices.device
+        allowed, tau = {}, {}
+        for k in heads.layers:
+            allowed[k] = torch.tensor([k in ks for ks, _ in depths], device=dev)
+            tau[k] = torch.tensor(
+                [t.get(k, heads.default_tau.get(k, 2.0)) for _, t in depths],
+                device=dev, dtype=torch.float32,
+            )
+        step = h2o_exits.ExitStep(
+            rows=logits_indices[:num_reqs],
+            label_ids=label_ids,
+            temps=torch.tensor(temps, device=dev, dtype=torch.float32),
+            allowed=allowed,
+            tau=tau,
+        )
+        h2o_exits.STEP = step
+        return step
+
+    def _h2o_record_depth(self, num_reqs, k):
+        """depth_used for every request with an exit policy in this step."""
+        self.h2o_depth_used = {}
+        if h2o_exits.HEADS is None:
+            return
+        n_layers = self.model_config.hf_text_config.num_hidden_layers
+        for rid in self.input_batch.req_ids[:num_reqs]:
+            rs = self.requests[rid]
+            if self._h2o_policy(rs) is not None:
+                self.h2o_depth_used[rid] = k if k is not None else n_layers
+
     def _model_forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -4574,13 +4640,29 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+            h2o_step = self._h2o_exit_step(scheduler_output, logits_indices, num_reqs)
+            try:
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+                h2o_k = None
+            except h2o_exits.H2OExit as e:
+                # every request exited at layer e.k: hand the runner a hidden
+                # tensor whose answer-slot rows are the exits' normed states;
+                # the lm_head / logprob readout below is unchanged
+                h2o_k = e.k
+                n_tok = positions.shape[-1]
+                model_output = torch.zeros(
+                    (n_tok, e.hidden.shape[-1]), dtype=e.hidden.dtype, device=e.hidden.device
+                )
+                model_output[h2o_step.rows] = e.hidden
+            finally:
+                h2o_exits.STEP = None
+            self._h2o_record_depth(num_reqs, h2o_k)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4905,6 +4987,7 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
+                h2o_depth_used=self.h2o_depth_used or None,
             )
 
         if not self.use_async_scheduling:
@@ -5532,6 +5615,10 @@ class GPUModelRunner(
             format_gib(self.model_memory_usage),
             time_after_load - time_before_load,
         )
+        # H2O early exit: add-on heads beside the weights (no-op unless
+        # VLLM_H2O_EXITS is set)
+        self.h2o_depth_used: dict[str, int] = {}
+        h2o_exits.load(self.get_model(), self.model_config.model, self.device)
 
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (

@@ -373,6 +373,10 @@ class ModelRunnerOutput:
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
 
+    # H2O early exit (vllm/h2o_exits.py): req_id -> layers run, for requests
+    # with an exit policy; None otherwise.
+    h2o_depth_used: dict[str, int] | None = None
+
     @staticmethod
     def with_kv_conn_output_only(
         kv_connector_output: KVConnectorOutput | None,

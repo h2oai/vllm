@@ -81,6 +81,18 @@ logger = init_logger(__name__)
 BIDIRECTIONAL_MAX_DEFERRALS = 8
 
 
+def _h2o_with_depth(kv_transfer_params, model_runner_output, req_id):
+    """H2O early exit v1 transport: the request's depth_used rides in the
+    per-request kv_transfer_params dict (returned to the client by the
+    completions API); untouched for requests without an exit policy."""
+    depths = getattr(model_runner_output, "h2o_depth_used", None)
+    if not depths or req_id not in depths:
+        return kv_transfer_params
+    out = dict(kv_transfer_params or {})
+    out["h2o_depth_used"] = depths[req_id]
+    return out
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -2264,7 +2276,9 @@ class Scheduler(SchedulerInterface):
                             if finish_reason is not None
                             else None
                         ),
-                        kv_transfer_params=kv_transfer_params,
+                        kv_transfer_params=_h2o_with_depth(
+                            kv_transfer_params, model_runner_output, req_id
+                        ),
                         ec_transfer_params=ec_transfer_params,
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,

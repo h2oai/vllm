@@ -599,7 +599,7 @@ class KVCacheManager:
         # H2O per-request attention: a bidirectional request carries no block
         # hashes (its KV is not causal and must never be shared through the
         # prefix cache), so there is nothing to cache for it.
-        if request.block_hashes or getattr(request, "attention_mode", "causal") != "bidirectional":
+        if request.block_hashes or (getattr(request, "attention_mode", "causal") != "bidirectional" and getattr(request, "exit_policy", None) is None):
             self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
@@ -798,7 +798,7 @@ class KVCacheManager:
                 that are already cached and tokens to be cached.
         """
         if self.enable_caching and (
-            request.block_hashes or getattr(request, "attention_mode", "causal") != "bidirectional"
+            request.block_hashes or (getattr(request, "attention_mode", "causal") != "bidirectional" and getattr(request, "exit_policy", None) is None)
         ):
             # H2O per-request attention: a bidirectional request has no block
             # hashes and its (non-causal) KV is never committed to the cache

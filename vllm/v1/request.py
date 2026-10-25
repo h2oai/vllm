@@ -428,6 +428,16 @@ class Request:
             if self.max_tokens != 1:
                 raise ValueError(BIDIRECTIONAL_NEEDS_ONE_TOKEN)
             block_hasher = None  # no prefix-cache reads or writes for this request
+        # H2O early exit (vllm/h2o_exits.py): a request with an exit policy is
+        # prefill-only and never shares KV blocks through the prefix cache (an
+        # exited pass leaves the layers above the exit unwritten).
+        from vllm.h2o_exits import parse_exit_policy
+
+        self.exit_policy = parse_exit_policy(sampling_params)
+        if self.exit_policy is not None:
+            if self.max_tokens != 1:
+                raise ValueError("exit_policy needs max_tokens=1 (a prefill readout)")
+            block_hasher = None
         # steps this request was deferred for lack of room (bounded aging in the
         # scheduler)
         self.bidirectional_deferrals = 0
