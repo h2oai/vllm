@@ -1718,8 +1718,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             skip_compiled = True
 
         # H2O per-request attention: a batch with a bidirectional request never
-        # replays a cudagraph captured with the causal kernel (the per-sequence
-        # flag would be ignored): it runs eagerly.
+        # replays a FULL cudagraph (captured with the causal kernel: the
+        # per-sequence flag would be ignored). PIECEWISE graphs are fine: the
+        # attention runs eagerly between the captured pieces and reads the flag
+        # from this step's metadata.
         has_bidirectional = bool(self.req_attention_mode) and any(
             rid in self.req_attention_mode
             for rid in getattr(scheduler_output, "num_scheduled_tokens", {})
@@ -1732,7 +1734,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_size,
             self.dp_rank,
             max_query_len=max_query_len,
-            need_eager=is_profile or skip_compiled or has_bidirectional,
+            need_eager=is_profile or skip_compiled,
+            no_full=has_bidirectional,
             num_active_loras=num_active_loras,
             parallel_config=self.parallel_config,
             allow_ubatching=(
