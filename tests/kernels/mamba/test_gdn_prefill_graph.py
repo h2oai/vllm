@@ -240,13 +240,33 @@ CASES = [
 def test_prefill_graph_matches_eager(backend, state_dtype, query_lens, cached):
     if backend == "flashinfer" and not current_platform.is_device_capability(90):
         pytest.skip("FlashInfer GDN prefill runs on SM90 here")
+    graphs = GDNPrefillGraphs(max_tokens=2048, max_seqs=16)
+    _check_graph_vs_eager(backend, state_dtype, query_lens, cached, graphs)
+    assert len(graphs.graphs) == 1
+
+
+@needs_gpu
+@pytest.mark.parametrize("backend", ["triton", "flashinfer"])
+@pytest.mark.parametrize(
+    "query_lens,cached", [([117, 5, 64], [0, 32, 0]), ([90], [48])]
+)
+def test_precapture_matches_eager(backend, query_lens, cached):
+    if backend == "flashinfer" and not current_platform.is_device_capability(90):
+        pytest.skip("FlashInfer GDN prefill runs on SM90 here")
+    graphs = GDNPrefillGraphs(max_tokens=256, max_seqs=4, precapture=True)
+    _check_graph_vs_eager(backend, torch.float32, query_lens, cached, graphs)
+    # every (1/2/4 sequences) x (64..256 tokens) shape, captured at the first
+    # prefill; the real steps captured nothing more
+    assert len(graphs.graphs) == 3 * 5
+
+
+def _check_graph_vs_eager(backend, state_dtype, query_lens, cached, graphs):
     from vllm.model_executor.layers.mamba.mamba_utils import (
         MambaStateShapeCalculator,
     )
 
     torch.manual_seed(0)
     cfg, device, builder, make_layer = _setup(backend)
-    graphs = GDNPrefillGraphs(max_tokens=2048, max_seqs=16)
     conv_shape, ssm_shape = MambaStateShapeCalculator.gated_delta_net_state_shape(
         1, H, HV, K, V, CONV_KERNEL, num_spec=0
     )
@@ -306,7 +326,6 @@ def test_prefill_graph_matches_eager(backend, state_dtype, query_lens, cached):
             slots = meta.prefill_state_indices.tolist()
             assert NULL_BLOCK_ID not in slots
             torch.testing.assert_close(ssm_g[1:], ssm_e[1:], atol=0, rtol=0)
-    assert len(graphs.graphs) == 1
 
 
 @needs_gpu

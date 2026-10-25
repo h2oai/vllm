@@ -38,6 +38,11 @@ bucket) for a token bucket B >= the step's T tokens, on static buffers:
   still points at. Each graph therefore holds references to the library
   buffers that existed when it was captured.
 
+With VLLM_GDN_PREFILL_GRAPH_PRECAPTURE=1 every (sequence count, bucket) shape
+of a layer is captured at that layer's first eligible prefill (a few seconds
+in all, which a server's warm-up absorbs) instead of when a step first meets
+it, so no request under load pays a capture.
+
 Everything else (decodes, MTP, ROCm/XPU/CPU, steps above the largest bucket or
 with more prefills) takes the normal eager path.
 VLLM_GDN_PREFILL_GRAPH_MAX_TOKENS sets the largest bucket (0 disables).
@@ -91,7 +96,10 @@ class _Bucket:
 
 class GDNPrefillGraphs:
     def __init__(
-        self, max_tokens: int | None = None, max_seqs: int | None = None
+        self,
+        max_tokens: int | None = None,
+        max_seqs: int | None = None,
+        precapture: bool | None = None,
     ) -> None:
         self.max_tokens = (
             envs.VLLM_GDN_PREFILL_GRAPH_MAX_TOKENS if max_tokens is None else max_tokens
@@ -110,6 +118,13 @@ class GDNPrefillGraphs:
         self._step_bucket: _Bucket | None = None
         self.disabled_reason: str | None = None
         self._shapes_seen: set[tuple[int, int]] = set()
+        self.precapture = (
+            envs.VLLM_GDN_PREFILL_GRAPH_PRECAPTURE if precapture is None else precapture
+        )
+        self._precaptured: set[tuple[str, str]] = set()
+        # static input/output rows per token bucket, shared by its sequence
+        # counts (one bucket runs at a time)
+        self._io: dict[int, tuple[dict, dict]] = {}
 
     # ------------------------------------------------------------------
     def bucket_size(self, num_tokens: int) -> int | None:
@@ -188,6 +203,13 @@ class GDNPrefillGraphs:
             return False
         if not out.is_cuda or torch.cuda.is_current_stream_capturing():
             return False
+        body_key = (layer.prefix, getattr(body, "__name__", ""))
+        if self.precapture and body_key not in self._precaptured:
+            self._precaptured.add(body_key)
+            if not self._precapture_layer(layer, body, inputs, out):
+                return False
+            # the synthetic loads overwrote the static metadata
+            self._step_metadata = None
         num_tokens = md.num_actual_tokens
         size = self.graph_size(layer, num_tokens, md.num_prefills)
         if size is None:
@@ -212,27 +234,39 @@ class GDNPrefillGraphs:
             static_in.append(buf)
         static_out = self._buffer(bucket.outputs, (0,), size, out)
 
-        key = (layer.prefix, getattr(body, "__name__", ""), num_seqs, size)
+        key = body_key + (num_seqs, size)
         graph = self.graphs.get(key)
         if graph is None:
-            try:
-                graph = self._capture(layer, body, bucket, static_in, static_out)
-            except Exception:
-                # never fail the step: fall back to the eager path for good
-                self.disabled_reason = "capture failed"
-                logger.warning(
-                    "GDN prefill CUDA graph capture failed for %s (%d sequences, "
-                    "bucket %d); GDN prefills run eagerly from now on.",
-                    layer.prefix,
-                    num_seqs,
-                    size,
-                    exc_info=True,
-                )
+            graph = self._capture_and_store(
+                key, layer, body, bucket, static_in, static_out
+            )
+            if graph is None:
                 return False
-            self.graphs[key] = graph
-            self._graph_buffers[key] = _library_scratch_buffers()
-            if (num_seqs, size) not in self._shapes_seen:
-                self._shapes_seen.add((num_seqs, size))
+        graph.replay()
+        out[:num_tokens].copy_(static_out[:num_tokens])
+        return True
+
+    def _capture_and_store(self, key, layer, body, bucket, static_in, static_out):
+        num_seqs, size = bucket.num_seqs, bucket.size
+        try:
+            graph = self._capture(layer, body, bucket, static_in, static_out)
+        except Exception:
+            # never fail the step: fall back to the eager path for good
+            self.disabled_reason = "capture failed"
+            logger.warning(
+                "GDN prefill CUDA graph capture failed for %s (%d sequences, "
+                "bucket %d); GDN prefills run eagerly from now on.",
+                layer.prefix,
+                num_seqs,
+                size,
+                exc_info=True,
+            )
+            return None
+        self.graphs[key] = graph
+        self._graph_buffers[key] = _library_scratch_buffers()
+        if (num_seqs, size) not in self._shapes_seen:
+            self._shapes_seen.add((num_seqs, size))
+            if not self.precapture:  # pre-capture logs once per layer instead
                 logger.info(
                     "GDN prefill CUDA graphs: first capture for %d sequences, "
                     "bucket %d (%d shapes, %d graphs so far)",
@@ -241,9 +275,69 @@ class GDNPrefillGraphs:
                     len(self._shapes_seen),
                     len(self.graphs),
                 )
-        graph.replay()
-        out[:num_tokens].copy_(static_out[:num_tokens])
+        return graph
+
+    def _precapture_layer(self, layer, body, inputs, out) -> bool:
+        """Capture every (sequence count, bucket) shape of this layer now, on
+        synthetic metadata (one sequence filling the bucket, the null state
+        block as every slot); a real step only reloads the static metadata."""
+        t0 = time.perf_counter()
+        body_key = (layer.prefix, getattr(body, "__name__", ""))
+        count = 0
+        for n in _SEQ_BUCKETS:
+            if n > self.max_seqs:
+                break
+            for size in _BUCKETS:
+                if size > self.max_tokens:
+                    break
+                key = body_key + (n, size)
+                if key in self.graphs:
+                    continue
+                bucket = self._bucket(n, size, out.device)
+                self._load_synthetic(bucket)
+                static_in = [
+                    self._buffer(bucket.inputs, (i,), size, x)
+                    for i, x in enumerate(inputs)
+                ]
+                static_out = self._buffer(bucket.outputs, (0,), size, out)
+                if (
+                    self._capture_and_store(
+                        key, layer, body, bucket, static_in, static_out
+                    )
+                    is None
+                ):
+                    return False
+                count += 1
+        if count:
+            logger.info(
+                "GDN prefill CUDA graphs: pre-captured %d shapes for %s in %.1f s "
+                "(%d graphs in all)",
+                count,
+                layer.prefix,
+                time.perf_counter() - t0,
+                len(self.graphs),
+            )
         return True
+
+    def _load_synthetic(self, bucket: _Bucket) -> None:
+        """Metadata of one sequence filling the bucket (the rest empty), on the
+        null state block, for a capture outside a real step."""
+        n, size = bucket.num_seqs, bucket.size
+        max_chunks, max_programs = self._bounds(n, size)
+        bucket.query_start_loc.fill_(size)
+        bucket.query_start_loc[0] = 0
+        bucket.state_slot.fill_(NULL_BLOCK_ID)
+        bucket.has_initial_state.fill_(False)
+        bucket.chunk_indices[:, 0] = 0
+        bucket.chunk_indices[:, 1] = torch.arange(
+            max_chunks, device=bucket.row_index.device
+        )
+        bucket.chunk_offsets.fill_(max_chunks)
+        bucket.chunk_offsets[0] = 0
+        bucket.conv_batch_ptr.fill_(0)
+        bucket.conv_chunk_offset_ptr.copy_(
+            torch.arange(max_programs, device=bucket.row_index.device)
+        )
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -390,8 +484,8 @@ class GDNPrefillGraphs:
             conv_chunk_offset_ptr=conv_chunk_offset_ptr,
             row_index=row_index,
             pad_rows=pad_rows,
-            inputs={},
-            outputs={},
+            inputs=self._io.setdefault(size, ({}, {}))[0],
+            outputs=self._io[size][1],
         )
         self.buckets[(n, size)] = bucket
         return bucket

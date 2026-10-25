@@ -130,6 +130,7 @@ if TYPE_CHECKING:
     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
     VLLM_GDN_PREFILL_GRAPH_MAX_TOKENS: int = 2048
     VLLM_GDN_PREFILL_GRAPH_MAX_SEQS: int = 16
+    VLLM_GDN_PREFILL_GRAPH_PRECAPTURE: bool = False
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -1220,6 +1221,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (one graph set per sequence count); 1 = single-sequence prefills only.
     "VLLM_GDN_PREFILL_GRAPH_MAX_SEQS": lambda: int(
         os.getenv("VLLM_GDN_PREFILL_GRAPH_MAX_SEQS", "16")
+    ),
+    # Capture every GDN prefill graph shape of a layer at its first prefill
+    # (a few seconds, absorbed by a server warm-up) instead of when a step
+    # first meets the shape.
+    "VLLM_GDN_PREFILL_GRAPH_PRECAPTURE": lambda: bool(
+        int(os.getenv("VLLM_GDN_PREFILL_GRAPH_PRECAPTURE", "0"))
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (
