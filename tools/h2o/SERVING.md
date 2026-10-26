@@ -60,7 +60,7 @@ Sources:
 | `--mamba-ssm-cache-dtype` | model default | model default; `bfloat16` is an option | c = 16: 78.1 -> 81.7/s (+3-5 %); prefix block 528 -> 272 tokens; 0 dev flips with patches A+B, max \|dp\| 0.022. Not yet parity-checked together with the GDN graphs. Hosted: bfloat16 |
 | `--max-model-len` | `MAX_LEN`, default 40960 | same; hosted short lane 16384, long lane auto (131072 on an H100) | 4B package |
 | `--gpu-memory-utilization` | 0.90 | 0.90 (hosted: 0.45 + 0.40 for two lanes) | 4B package |
-| `--tokenizer` | `<model>/tokenizer` (the training `Qwen2Tokenizer`) | same | From transformers 5.18 the default load is `Qwen3_5Tokenizer`, which splits 8 of 24 Devanagari/Arabic probes differently. JB231 206 with either tokenizer; DI 0.3: 196 of 158,028 rows tokenize differently, hit rate 0.851 vs 0.877 on those rows (4B card, "Tokenizer") |
+| `--tokenizer` | `<model>/tokenizer` (the training `Qwen2Tokenizer`) | same, on **every** 4B engine | The repository root holds `config.json` beside the tokenizer files, so from transformers 5.18 a load of the root (vLLM's default when `--tokenizer` is not given, or a front end that loads the snapshot folder) gives `Qwen3_5Tokenizer`. That tokenizer splits 8 of the 24 probes in `tokenizer_contract.json` differently (Devanagari, Arabic). `tokenizer/` holds the same files without a `config.json` and loads as `Qwen2Tokenizer`. Measured: JB231 206 with either tokenizer; DI 0.3: 196 of 158,028 rows tokenize differently, hit rate 0.851 vs 0.877 on those rows (4B card, "Tokenizer"). The package's shim checks at start-up that vLLM's `/tokenize` reproduces all 24 probes. Hosted on 2026-10-26 served the root on both lanes; the fix is pending |
 | Images | `--limit-mm-per-prompt '{"image": 4, "video": 0}'`, `--mm-processor-kwargs '{"max_pixels": 1048576}'` (= `serve_config.json` image.max_pixels; when the engine cap differs from the cap the shim sends, the first image request is very slow) | same | 4B package; image limit 16 costs no KV (engine tuning, A6000) |
 | `--mm-processor-cache-gb 0` | from v1.4.1 | from v1.4.1; hosted: on | The front-end image cache drifted from the engine's on the first image after a start (a 500). Off: answers exact, an image 3-question decision at c = 8 up to ~12 % slower (engine parity row 7) |
 | `--max-logprobs` | not needed (exact label-id reads) | not needed | |
@@ -86,6 +86,25 @@ Sources:
 | `VLLM_CACHE_ROOT` | one folder per fork commit, reading mode, MAX_LEN, window, image setting and quantization | same | same | 31B package (vLLM's AOT key misses these) |
 | `VLLM_USE_FLASHINFER_SAMPLER=0` | yes | yes | yes | 31B package |
 | transformers | 5.20.0 (the measured set) | 5.20.0 | package 5.20.0; hosted pins 5.19.0 | 31B package `PROFILE_ENGINE` |
+
+### The tokenizer: one folder for the engine and every front end
+
+The engine (`vllm serve --tokenizer`) and any component that tokenizes outside it must load **the same tokenizer folder**,
+and that folder must be the one the model was trained with. The components that tokenize outside the engine include a
+shim or gateway that counts tokens or sends prompt ids, a BM25 state budget and a local length check.
+
+- 4B: use `<model>/tokenizer` everywhere.
+- 31B: `tokenizer.json` at the repository root (the package's shim and vLLM both use it).
+
+Two checks catch a mismatch:
+- **The contract probes.** The 4B's `tokenizer_contract.json` holds 24 probe strings with the training tokenizer's ids.
+  A front end that uses vLLM's `/tokenize` checks them at start-up, as the package shim does.
+- **The parity check.** A front end that tokenizes locally compares its ids with the engine's on the same probes before
+  it serves, as our hosted gateway does. That check only proves the two agree with each other, so the folder both load
+  must still be the training one.
+
+A setting change that moves only one side either fails the parity check, or leaves both on the wrong tokenizer
+silently.
 
 ### Any other model on this fork
 
