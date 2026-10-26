@@ -772,6 +772,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_caches = [
             cache for cache in kv_caches_dict.values() if cache.device == self.device
         ]
+        # Graphs of the GDN prefill core record the KV cache tensors they were
+        # captured against (see prefill_graph.py): a (re)binding invalidates
+        # every one of them, for the profiling cache and the real one alike.
+        from vllm.model_executor.layers.mamba.gdn.prefill_graph import (
+            gdn_prefill_graphs,
+        )
+
+        gdn_prefill_graphs.reset()
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:

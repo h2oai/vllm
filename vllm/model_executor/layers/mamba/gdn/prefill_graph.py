@@ -125,6 +125,73 @@ class GDNPrefillGraphs:
         # static input/output rows per token bucket, shared by its sequence
         # counts (one bucket runs at a time)
         self._io: dict[int, tuple[dict, dict]] = {}
+        # the KV cache tensors (conv state, SSM state) each layer's graphs were
+        # captured against: layer prefix -> ((data_ptr, shape), ...)
+        self._kv_bound: dict[str, tuple] = {}
+
+    # ------------------------------------------------------------------
+    def reset(self) -> None:
+        """Forget every captured graph, bucket and static buffer; the next
+        eligible prefill captures afresh.
+
+        A captured graph records the layer's KV cache tensors (the conv and
+        SSM state blocks) it ran against: their addresses and, for the
+        ``ssm_state[state_slots]`` gather, the number of blocks. CUDA-graph
+        memory profiling captures against a throwaway minimal KV cache (one
+        block per sequence) and then frees it, so a graph captured there must
+        never replay against the real cache: it would read freed memory and
+        assert on any block id past the minimal count. Called from the
+        profiling teardown and whenever the runner (re)binds KV caches."""
+        self.graphs.clear()
+        self._graph_buffers.clear()
+        self.buckets.clear()
+        self._io.clear()
+        self._precaptured.clear()
+        self._shapes_seen.clear()
+        self._fi_sizes.clear()
+        self._step_metadata = None
+        self._step_bucket = None
+        self._kv_bound.clear()
+
+    @staticmethod
+    def _kv_signature(layer) -> tuple | None:
+        """Identity of the KV cache tensors a layer is bound to, or None when
+        it holds none (not yet bound, or detached)."""
+        states = getattr(layer, "kv_cache", None)
+        if not states:
+            return None
+        sig = []
+        for t in states:
+            if not isinstance(t, torch.Tensor) or t.numel() == 0:
+                return None
+            sig.append((t.data_ptr(), tuple(t.shape)))
+        return tuple(sig)
+
+    def check_kv_binding(self, layer) -> bool:
+        """True when this layer's KV cache binding is the one its graphs were
+        captured against (recording it on the first call). False when the
+        binding changed, after dropping every graph (a rebinding is global:
+        the real KV cache replaces the profiling one for all layers at once).
+        Also False, with nothing captured, when the layer holds no cache."""
+        sig = self._kv_signature(layer)
+        if sig is None:
+            return False
+        key = layer.prefix
+        bound = self._kv_bound.get(key)
+        if bound is None:
+            self._kv_bound[key] = sig
+            return True
+        if bound == sig:
+            return True
+        logger.info(
+            "GDN prefill CUDA graphs: the KV cache of %s was re-bound since its "
+            "graphs were captured; dropping %d graphs, the next prefill recaptures.",
+            key,
+            len(self.graphs),
+        )
+        self.reset()
+        self._kv_bound[key] = sig
+        return False
 
     # ------------------------------------------------------------------
     def bucket_size(self, num_tokens: int) -> int | None:
@@ -202,6 +269,11 @@ class GDNPrefillGraphs:
         if not self.eligible(layer, md):
             return False
         if not out.is_cuda or torch.cuda.is_current_stream_capturing():
+            return False
+        if not self.check_kv_binding(layer):
+            # the graphs were captured against another KV cache (profiling)
+            # and were just dropped, or the layer holds no cache: run eagerly
+            # this step; the next eligible step captures against the real one
             return False
         body_key = (layer.prefix, getattr(body, "__name__", ""))
         if self.precapture and body_key not in self._precaptured:

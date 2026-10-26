@@ -1027,6 +1027,17 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
     if (model := getattr(runner, "model", None)) is not None:
         layers = itertools.chain(layers, model.modules())
     clear_layer_kv_caches(layers)
+    # The GDN prefill CUDA graphs (a module-level registry, outside the
+    # cudagraph manager and the wrappers cleared above) were captured against
+    # the profiling KV cache too: forget them here, or the first real prefill
+    # replays a graph whose state-slot gather is bound to the freed minimal
+    # cache (an "index out of bounds" device assert when --max-num-seqs is
+    # small enough for a profiling dummy run to be graph-eligible).
+    from vllm.model_executor.layers.mamba.gdn.prefill_graph import (
+        gdn_prefill_graphs,
+    )
+
+    gdn_prefill_graphs.reset()
     release_hisparse_profiling_cache(runner.compilation_config.static_forward_context)
     runner.cache_config.num_gpu_blocks = None
     runner.maybe_remove_all_loras(runner.lora_config)

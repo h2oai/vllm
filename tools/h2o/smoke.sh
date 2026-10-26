@@ -48,7 +48,8 @@ cp -r "$REPO/tests" "$WORK/tests"; cp "$REPO/pyproject.toml" "$WORK/"
 TESTS=()  # the ones this commit has (older release lines have fewer)
 for t in tests/v1/core/test_per_request_attention.py tests/v1/worker/test_per_request_attention_groups.py \
     tests/v1/attention/test_kv_sharing_fast_prefill_per_request.py tests/models/test_gemma4_noncausal.py \
-    tests/models/test_gemma4_noncausal_inert.py; do
+    tests/models/test_gemma4_noncausal_inert.py tests/kernels/mamba/test_gdn_prefill_graph.py \
+    tests/kernels/mamba/test_gdn_prefill_graph_rebind.py; do
   [ -f "$WORK/$t" ] && TESTS+=("$t")
 done
 [ "${#TESTS[@]}" -gt 0 ] || { echo "no fork tests found"; exit 1; }
