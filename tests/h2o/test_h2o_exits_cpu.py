@@ -248,6 +248,31 @@ def test_commit_rule_with_prefix_cache_write():
     assert r.exit_policy is not None and r.block_hashes == [] and not _commits_to_cache(r)
 
 
+def test_exit_request_is_prefilled_in_one_step():
+    """an exit-policy request commits nothing, so the align split (there to cache states) does not apply to it"""
+    import torch as _t
+
+    from tests.v1.core.utils import create_requests, create_scheduler
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    scheduler = create_scheduler(max_num_batched_tokens=8192, block_size=16, enable_prefix_caching=True,
+                                 kv_cache_spec=MambaSpec(block_size=16, shapes=((1, 1),), dtypes=(_t.float32,),
+                                                         mamba_cache_mode="align"))
+    scheduler.need_mamba_block_aligned_split = True
+    ex, plain = create_requests(num_requests=2, num_tokens=40, max_tokens=1, block_size=16, req_ids=["ex", "plain"])
+    ex.exit_policy = object()
+    ex.prefix_cache_write = False  # what Request.__init__ sets with an exit policy (checked below)
+    scheduler.add_request(ex)
+    scheduler.add_request(plain)
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens["ex"] == 40
+    assert out.num_scheduled_tokens["plain"] == 32  # an ordinary request is split at the state block as before
+    from vllm.v1.request import Request
+
+    r = Request("r", list(range(40)), sp({"exit_policy": "auto"}), None, block_hasher=None)
+    assert r.exit_policy is not None and not r.prefix_cache_write
+
+
 # ------------------------------------------------------------------ no graph change
 def test_model_and_compile_files_have_no_exit_points():
     """the exits live inside the existing GDN op: the model loop and the splitting-op list are untouched"""

@@ -462,6 +462,10 @@ class Request:
             if self.max_tokens != 1:
                 raise ValueError("exit_policy needs max_tokens=1 (a prefill readout)")
             block_hasher = None
+            # it commits nothing, so it is prefilled in one step: no Mamba
+            # block-aligned split (which only exists to cache states), and an
+            # exit then skips the upper layers for the whole prompt
+            self.prefix_cache_write = False
         # steps this request was deferred for lack of room (bounded aging in the
         # scheduler)
         self.bidirectional_deferrals = 0
