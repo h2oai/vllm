@@ -787,8 +787,6 @@ class CompilationConfig:
         "vllm::rocm_aiter_sparse_attn_indexer",
         "vllm::deepseek_v4_attention",
         "vllm::hpc_rope_norm_forward",
-        # H2O early exit (vllm/h2o_exits.py): only traced when exits are loaded
-        "vllm::h2o_exit_point",
     ]
 
     def compute_hash(self) -> str:

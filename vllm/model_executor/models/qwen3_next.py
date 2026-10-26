@@ -619,17 +619,6 @@ class Qwen3NextDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-def _h2o_exit_init(model: nn.Module) -> None:
-    """H2O early exit: the static set of exit points (empty unless
-    VLLM_H2O_EXITS is set, so the traced graph is unchanged by default)."""
-    from vllm import h2o_exits  # registers vllm::h2o_exit_point
-
-    model.h2o_exit_layers = h2o_exits.exit_layers_from_env()
-    model.register_buffer(
-        "h2o_exit_flag", torch.zeros(1, dtype=torch.int32), persistent=False
-    )
-
-
 @support_torch_compile
 class Qwen3NextModel(nn.Module, EagleModelMixin):
     hf_to_vllm_mapper = WeightsMapper(
@@ -688,7 +677,6 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
             self.norm = PPMissingLayer()
 
         self.aux_hidden_state_layers: tuple[int, ...] = ()
-        _h2o_exit_init(self)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -733,13 +721,6 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
             self._maybe_add_hidden_state(
                 aux_hidden_states, layer_idx + 1, hidden_states, residual
             )
-            if layer_idx + 1 in self.h2o_exit_layers:
-                # H2O early exit (vllm/h2o_exits.py): a splitting op that reads
-                # x_k = hidden_states + residual at the answer slots and may end
-                # the pass; it never writes the trunk's tensors.
-                torch.ops.vllm.h2o_exit_point(
-                    hidden_states, residual, layer_idx + 1, self.h2o_exit_flag
-                )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(

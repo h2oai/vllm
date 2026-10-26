@@ -110,17 +110,25 @@ def test_agreement_matches_reference(heads):
     assert torch.allclose(got, torch.stack(exp), atol=1e-6)
 
 
-# ------------------------------------------------------------------ the exit op
-def run_op(k, hidden, residual, flag):
-    h2o_exits.h2o_exit_point(hidden, residual, k, flag)
+# ------------------------------------------------------------------ the GDN hook
+QKV = 3 * H
 
 
-def test_op_noop_without_step(heads):
-    h2o_exits.HEADS = heads[0]; h2o_exits.STEP = None
-    hid, res, flag = torch.randn(6, H), torch.randn(6, H), torch.zeros(1, dtype=torch.int32)
-    h0, r0 = hid.clone(), res.clone()
-    run_op(20, hid, res, flag)
-    assert torch.equal(hid, h0) and torch.equal(res, r0) and int(flag) == 0
+@pytest.fixture()
+def recon_heads(heads):
+    """attach a reconstruction map built like h2o_exits.load: R = diag(1/(1+w_ln)) pinv(W_qkv)."""
+    h, t, norm_w, lm = heads
+    g = torch.Generator().manual_seed(1)
+    w_qkv = torch.randn(QKV, H, generator=g) / H ** 0.5
+    ln = torch.randn(H, generator=g) * 0.1
+    h.recon = {k: (torch.linalg.pinv(w_qkv) / (ln + 1.0)[:, None]) for k in (20, 24)}
+    return h, t, norm_w, w_qkv, ln
+
+
+def project(x, w_qkv, ln):
+    """what the GDN op receives for a residual-stream state x: W_qkv (1 + w_ln) x / rms(x)"""
+    xn = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)
+    return (xn * (ln + 1.0)) @ w_qkv.T
 
 
 def make_step(n, tau, allowed=True):
@@ -130,34 +138,62 @@ def make_step(n, tau, allowed=True):
         tau={20: torch.full((n,), tau), 24: torch.full((n,), tau)})
 
 
-def test_op_exits_when_all_agree(heads):
-    h, t, norm_w, _ = heads
-    h2o_exits.HEADS = h
-    h2o_exits.STEP = make_step(3, tau=0.0)
-    hid, res, flag = torch.randn(6, H), torch.randn(6, H), torch.zeros(1, dtype=torch.int32)
-    h0, r0 = hid.clone(), res.clone()
+def test_reconstruction_recovers_scale_free_state(recon_heads):
+    h, _, _, w_qkv, ln = recon_heads
+    x = torch.randn(7, H) * 3.0
+    xn = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)
+    assert torch.allclose(project(x, w_qkv, ln) @ h.recon[20].T, xn, atol=1e-4)
+
+
+def test_hook_noop_without_step(recon_heads):
+    h2o_exits.HEADS = recon_heads[0]; h2o_exits.STEP = None
+    q = torch.randn(6, QKV); q0 = q.clone()
+    h2o_exits.gdn_hook(20, q)
+    assert torch.equal(q, q0)
+
+
+def test_hook_exits_when_all_agree(recon_heads):
+    h, t, norm_w, w_qkv, ln = recon_heads
+    h2o_exits.HEADS = h; h2o_exits.STEP = make_step(3, tau=0.0)
+    x = torch.randn(6, H)
+    q = project(x, w_qkv, ln); q0 = q.clone()
     with pytest.raises(h2o_exits.H2OExit) as e:
-        run_op(20, hid, res, flag)
-    assert e.value.k == 20 and int(flag) == 20
-    x = (h0 + r0)[torch.tensor([1, 3, 5])]
-    assert torch.allclose(e.value.hidden.float(), ref_normed(t, 20, norm_w, x), atol=1e-6)
-    assert torch.equal(hid, h0) and torch.equal(res, r0)          # the trunk's tensors are untouched
+        h2o_exits.gdn_hook(20, q)
+    assert e.value.k == 20
+    xn = x[torch.tensor([1, 3, 5])]
+    xn = xn * torch.rsqrt(xn.pow(2).mean(-1, keepdim=True) + 1e-6)
+    assert torch.allclose(e.value.hidden.float(), ref_normed(t, 20, norm_w, xn), atol=1e-4)
+    assert torch.equal(q, q0)                                     # the op's input is untouched
 
 
-def test_op_continues_when_one_fails(heads):
-    h2o_exits.HEADS = heads[0]
-    h2o_exits.STEP = make_step(3, tau=2.0)                       # nobody can reach 2.0
-    hid, res, flag = torch.randn(6, H), torch.randn(6, H), torch.zeros(1, dtype=torch.int32)
-    run_op(20, hid, res, flag)
-    assert int(flag) == 0 and h2o_exits.STEP.tried == [20]
+def test_hook_extra_columns_ignored(recon_heads):
+    """the fused op passes [q, k, v, z]: only the first qkv columns are read"""
+    h, t, norm_w, w_qkv, ln = recon_heads
+    h2o_exits.HEADS = h; h2o_exits.STEP = make_step(2, tau=0.0)
+    x = torch.randn(4, H)
+    q = torch.cat([project(x, w_qkv, ln), torch.randn(4, 17)], -1)
+    with pytest.raises(h2o_exits.H2OExit) as e:
+        h2o_exits.gdn_hook(20, q)
+    xn = x[torch.tensor([1, 3])]; xn = xn * torch.rsqrt(xn.pow(2).mean(-1, keepdim=True) + 1e-6)
+    assert torch.allclose(e.value.hidden.float(), ref_normed(t, 20, norm_w, xn), atol=1e-4)
 
 
-def test_op_respects_allowed(heads):
-    h2o_exits.HEADS = heads[0]
-    h2o_exits.STEP = make_step(2, tau=0.0, allowed=False)        # k=20 not in these requests' depths
-    run_op(20, torch.randn(4, H), torch.randn(4, H), torch.zeros(1, dtype=torch.int32))
+def test_hook_continues_when_one_fails(recon_heads):
+    h2o_exits.HEADS = recon_heads[0]; h2o_exits.STEP = make_step(3, tau=2.0)
+    h2o_exits.gdn_hook(20, torch.randn(6, QKV))
+    assert h2o_exits.STEP.tried == [20]
+
+
+def test_hook_respects_allowed(recon_heads):
+    h2o_exits.HEADS = recon_heads[0]; h2o_exits.STEP = make_step(2, tau=0.0, allowed=False)
+    h2o_exits.gdn_hook(20, torch.randn(4, QKV))                   # k=20 not in these requests' depths
     with pytest.raises(h2o_exits.H2OExit):
-        run_op(24, torch.randn(4, H), torch.randn(4, H), torch.zeros(1, dtype=torch.int32))
+        h2o_exits.gdn_hook(24, torch.randn(4, QKV))
+
+
+def test_hook_other_layers_ignored(recon_heads):
+    h2o_exits.HEADS = recon_heads[0]; h2o_exits.STEP = make_step(2, tau=0.0)
+    h2o_exits.gdn_hook(5, torch.randn(4, QKV))                    # not an exit layer: nothing happens
 
 
 # ------------------------------------------------------------------ transport + request
@@ -185,64 +221,12 @@ def test_request_policy_skips_prefix_cache():
         Request("r3", list(range(16)), sp({"exit_policy": "auto"}, max_tokens=4), None, block_hasher=hasher)
 
 
-# ------------------------------------------------------------------ tracing
-# The op is registered for the platform's dispatch key (CUDA on a GPU build); give it a CPU kernel here so the
-# miniature loop runs on a CPU-only test host. The kernel is the same Python function.
-try:
-    torch.library.impl("vllm::h2o_exit_point", "CPU")(h2o_exits.h2o_exit_point)
-except RuntimeError:
-    pass
+# ------------------------------------------------------------------ no graph change
+def test_model_and_compile_files_have_no_exit_points():
+    """the exits live inside the existing GDN op: the model loop and the splitting-op list are untouched"""
+    import inspect
 
-class Loop(torch.nn.Module):
-    """A miniature of Qwen3NextModel.forward's layer loop with the same exit hook."""
-
-    def __init__(self, layers):
-        super().__init__()
-        self.lin = torch.nn.ModuleList([torch.nn.Linear(H, H) for _ in range(layers)])
-        self.h2o_exit_layers = h2o_exits.exit_layers_from_env()
-        self.register_buffer("h2o_exit_flag", torch.zeros(1, dtype=torch.int32), persistent=False)
-
-    def forward(self, x):
-        residual = x
-        for i, lin in enumerate(self.lin):
-            x = lin(x + residual)
-            if i + 1 in self.h2o_exit_layers:
-                torch.ops.vllm.h2o_exit_point(x, residual, i + 1, self.h2o_exit_flag)
-        return x
-
-
-def traced_ops(model):
-    seen = []
-
-    def backend(gm, example_inputs):
-        seen.extend(str(n.target) for n in gm.graph.nodes if n.op == "call_function")
-        return gm.forward
-
-    torch._dynamo.reset()
-    torch.compile(model, backend=backend, fullgraph=True)(torch.randn(3, H))
-    return seen
-
-
-def test_exit_point_traced_only_when_enabled(monkeypatch):
-    monkeypatch.delenv("VLLM_H2O_EXITS", raising=False)
-    assert not any("h2o_exit_point" in s for s in traced_ops(Loop(24)))
-    monkeypatch.setenv("VLLM_H2O_EXITS", "1")
-    monkeypatch.setenv("VLLM_H2O_EXIT_LAYERS", "20,24")
-    ops = [s for s in traced_ops(Loop(24)) if "h2o_exit_point" in s]
-    assert len(ops) == 2                                          # kept (not dead-code eliminated), once per exit
-
-
-def test_exit_point_is_a_splitting_op():
     from vllm.config.compilation import CompilationConfig
-    assert "vllm::h2o_exit_point" in CompilationConfig._attention_ops
-
-
-def test_disabled_loop_is_numerically_identical(monkeypatch):
-    """Same weights, exits off vs on with no exit step: identical outputs."""
-    monkeypatch.delenv("VLLM_H2O_EXITS", raising=False)
-    torch.manual_seed(1); a = Loop(24)
-    monkeypatch.setenv("VLLM_H2O_EXITS", "1")
-    b = Loop(24); b.load_state_dict(a.state_dict())
-    h2o_exits.STEP = None
-    x = torch.randn(5, H)
-    assert torch.equal(a(x), b(x))
+    from vllm.model_executor.models import qwen3_next
+    assert not any("h2o" in op for op in CompilationConfig._attention_ops)
+    assert "h2o" not in inspect.getsource(qwen3_next.Qwen3NextModel.forward)

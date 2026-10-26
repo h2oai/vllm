@@ -3,6 +3,7 @@
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
 import os
+import re
 from typing import Literal
 
 import torch
@@ -10,7 +11,7 @@ from einops import rearrange
 from torch import nn
 
 from vllm import _custom_ops as ops
-from vllm import envs
+from vllm import envs, h2o_exits
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import (
@@ -1942,6 +1943,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
 
+def _h2o_layer_index(layer) -> int:
+    """The decoder-layer index of a GDN layer (from its prefix), cached."""
+    idx = getattr(layer, "_h2o_layer_idx", None)
+    if idx is None:
+        idx = int(re.search(r"layers\.(\d+)\.", layer.prefix + ".").group(1))
+        layer._h2o_layer_idx = idx
+    return idx
+
+
 @eager_break_during_capture
 def qwen_gdn_attention_core(
     qkv_or_qkvz: torch.Tensor,
@@ -1967,6 +1977,8 @@ def qwen_gdn_attention_core(
     layer_name = _resolve_layer_name(layer_name)
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
+    if h2o_exits.STEP is not None:  # H2O early exit: may end the pass at this layer
+        h2o_exits.gdn_hook(_h2o_layer_index(self), qkv_or_qkvz)
     if not use_aiter and gdn_prefill_graphs.run(
         self, self._forward_core, (qkv_or_qkvz, b_or_ba, a_or_z_out), core_attn_out
     ):
@@ -2004,6 +2016,8 @@ def qwen_gdn_attention_core_fused_norm_packed(
     layer_name = _resolve_layer_name(layer_name)
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
+    if h2o_exits.STEP is not None:  # H2O early exit: may end the pass at this layer
+        h2o_exits.gdn_hook(_h2o_layer_index(self), mixed_qkvz)
     if gdn_prefill_graphs.run(
         self, self._forward_core_fused_norm_packed, (mixed_qkvz, ba), core_attn_out
     ):
