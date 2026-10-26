@@ -221,6 +221,33 @@ def test_request_policy_skips_prefix_cache():
         Request("r3", list(range(16)), sp({"exit_policy": "auto"}, max_tokens=4), None, block_hasher=hasher)
 
 
+def test_commit_rule_with_prefix_cache_write():
+    """the 0.30.0.3 rebase joined two rules in _commits_to_cache: an exit-policy request (no block hashes) and a
+    prefix_cache_write=false request commit nothing; an ordinary causal request commits, a short one too"""
+    from types import SimpleNamespace
+
+    from vllm.v1.core.kv_cache_manager import _commits_to_cache
+
+    def req(**kw):
+        base = dict(prefix_cache_write=True, exit_policy=None, block_hashes=[b"h"], attention_mode="causal")
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    assert _commits_to_cache(req())
+    assert _commits_to_cache(req(block_hashes=[]))  # causal, under one block: stock commits
+    assert not _commits_to_cache(req(exit_policy=object(), block_hashes=[]))
+    assert not _commits_to_cache(req(prefix_cache_write=False))
+    assert not _commits_to_cache(req(prefix_cache_write=False, exit_policy=object(), block_hashes=[]))
+    assert not _commits_to_cache(req(attention_mode="bidirectional", block_hashes=[]))
+    # the Request itself: an exit policy keeps prefix_cache_write's parse and drops the hashes
+    from vllm.v1.request import Request
+
+    hasher = lambda r: [b"h"] * (len(r.all_token_ids) // 4)  # noqa: E731
+    r = Request("r1", list(range(16)), sp({"exit_policy": "auto", "prefix_cache_write": False}), None,
+                block_hasher=hasher)
+    assert r.exit_policy is not None and r.block_hashes == [] and not _commits_to_cache(r)
+
+
 # ------------------------------------------------------------------ no graph change
 def test_model_and_compile_files_have_no_exit_points():
     """the exits live inside the existing GDN op: the model loop and the splitting-op list are untouched"""
