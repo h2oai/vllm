@@ -1,24 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 """H2O early-exit heads on a frozen trunk (v1).
 
-Add-on exit heads read the residual stream after layer k at each request's answer
-slot (its last prompt token) and produce a normed hidden state that the model's own
-lm_head turns into logits, so the readout path (logprob_token_ids) is unchanged.
-The heads never write into the trunk.
+Add-on exit heads read the trunk's state after k decoder layers at each request's
+answer slot (its last prompt token) and produce a normed hidden state that the
+model's own lm_head turns into logits, so the readout path (logprob_token_ids) is
+unchanged. The heads never write into the trunk.
+
+No new graph split: the exit check runs inside the Gated DeltaNet core op of
+layer k (a splitting op the model already has; k is a multiple of 4, so layer k is
+a GDN layer). That op receives the qkv projection of the layer's input norm,
+f = W_qkv (1 + w_ln) * x_k / rms(x_k). The heads recover the scale-free state
+x_k / rms(x_k) = R_k f with R_k = diag(1 / (1 + w_ln)) pinv(W_qkv), computed once at
+load from the frozen weights. The compiled graph is therefore the same with or
+without exits, so full-depth outputs are unchanged by construction.
 
 A step exits at layer k only when EVERY request in the batch asked for an exit
 policy, is finishing its prefill in this step, and passes its agreement gate at k
-(the v1 batch rule). The exit check is a splitting custom op
-(vllm::h2o_exit_point) placed after each exit layer; it runs eagerly between the
-piecewise graphs and ends the forward pass by raising H2OExit, which the model
-runner catches. With no exit file loaded the op is never traced into the graph, so
-the engine is the same as without this module.
+(the v1 batch rule). An exit ends the forward pass by raising H2OExit from inside
+the eagerly executed core op; the model runner catches it.
 
 Exit file: ``exits.lightning`` beside the weights (safetensors format; not named
 *.safetensors so the weight loader does not read it as a trunk shard), enabled by
 VLLM_H2O_EXITS=1 (or a path). Tensors ``k{K}.A.weight``, ``k{K}.B.weight``,
-``k{K}.B.bias``, ``k{K}.agree.{0,2}.{weight,bias}``; metadata ``h2o_exits`` (JSON):
-{"layers": [20, 24], "tau": {"20": t, "24": t}, "auto": [20, 24], "eps": 1e-6}.
+``k{K}.B.bias``, ``k{K}.agree.{0,2}.{weight,bias}`` (heads trained on the
+scale-free state); metadata ``h2o_exits`` (JSON): {"layers": [20, 24], "tau":
+{"20": t, "24": t}, "auto": [20, 24], "eps": 1e-6, "input": "xnorm"}.
 
 Request policy (sampling_params.extra_args, i.e. vllm_xargs, flat values):
   exit_policy = "full" (default) | "auto" | a layer count; exit_temp = T (the
@@ -36,7 +42,6 @@ import torch
 import torch.nn.functional as F
 
 from vllm.logger import init_logger
-from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
@@ -44,7 +49,7 @@ EXIT_FILE = "exits.lightning"
 
 
 class H2OExit(Exception):
-    """Raised by the exit op to end the forward pass at layer k."""
+    """Raised inside layer k's core op to end the forward pass at layer k."""
 
     def __init__(self, k: int, hidden: torch.Tensor):
         super().__init__(k)
@@ -52,18 +57,9 @@ class H2OExit(Exception):
         self.hidden = hidden  # [num_reqs, hidden] normed exit states (model dtype)
 
 
-def exit_layers_from_env() -> tuple[int, ...]:
-    """The exit layers the model forward places exit points after (static, read
-    at model construction). Empty unless VLLM_H2O_EXITS is set."""
-    if not os.environ.get("VLLM_H2O_EXITS"):
-        return ()
-    raw = os.environ.get("VLLM_H2O_EXIT_LAYERS", "20,24")
-    return tuple(sorted(int(x) for x in raw.split(",") if x.strip()))
-
-
 # ---------------------------------------------------------------- policy
 def parse_exit_policy(sampling_params) -> dict | None:
-    """None for "full" (the default); else {"depths": [k...], "temp": T,
+    """None for "full" (the default); else {"depths": "auto" | [k], "temp": T,
     "tau": {k: t}} with depths resolved against the loaded heads later."""
     extra = getattr(sampling_params, "extra_args", None) or {}
     pol = extra.get("exit_policy")
@@ -96,7 +92,8 @@ def parse_exit_policy(sampling_params) -> dict | None:
 # ---------------------------------------------------------------- heads
 class ExitHeads(torch.nn.Module):
     def __init__(self, path: str, hidden: int, norm_weight: torch.Tensor,
-                 lm_head_weight: torch.Tensor, device: torch.device):
+                 lm_head_weight: torch.Tensor, device: torch.device,
+                 recon: dict[int, torch.Tensor] | None = None):
         super().__init__()
         from safetensors import safe_open
 
@@ -117,14 +114,17 @@ class ExitHeads(torch.nn.Module):
             if missing:
                 raise ValueError(f"{path}: exit k={k} lacks {sorted(missing)}")
         # frozen references to the trunk (never modified): final norm weight
-        # (Qwen3.5 RMSNorm scales by 1 + w) and the tied lm_head rows
+        # (Qwen3.5 RMSNorm scales by 1 + w), the tied lm_head rows, and the per-exit
+        # reconstruction maps R_k (qkv projection -> scale-free state)
         self.norm_w = norm_weight.detach().float() + 1.0
         self.lm_head = lm_head_weight
+        self.recon = recon or {}
         self.hidden = hidden
         logger.info("H2O exits loaded from %s: layers %s, tau %s", path,
                     self.layers, self.default_tau)
 
     def normed(self, k: int, x: torch.Tensor) -> torch.Tensor:
+        """E1 on the scale-free state x (= x_k / rms(x_k)), then the final norm."""
         p = self.p[k]
         x = x.float()
         z = x + F.linear(F.linear(x, p["A.weight"]), p["B.weight"], p["B.bias"])
@@ -155,7 +155,7 @@ HEADS: ExitHeads | None = None
 @dataclass
 class ExitStep:
     """Set by the model runner for a step in which every request asked for an
-    exit and finishes its prefill; None otherwise (then the exit op is a no-op)."""
+    exit and finishes its prefill; None otherwise (then the hook is a no-op)."""
     rows: torch.Tensor                       # [num_reqs] answer-slot token indices
     label_ids: list[list[int]]
     temps: torch.Tensor                      # [num_reqs]
@@ -167,8 +167,13 @@ class ExitStep:
 STEP: ExitStep | None = None
 
 
+def _qkv_rows(layer) -> int:
+    return (layer.key_dim * 2 + layer.value_dim) // layer.tp_size
+
+
 def load(model, model_dir: str, device) -> None:
-    """Load the exit file and bind it to the model's frozen norm and lm_head."""
+    """Load the exit file and bind it to the model's frozen norm, lm_head and the
+    per-exit reconstruction maps (from layer k's frozen input norm and qkv rows)."""
     global HEADS
     env = os.environ.get("VLLM_H2O_EXITS")
     if not env:
@@ -180,38 +185,49 @@ def load(model, model_dir: str, device) -> None:
     inner = lm.model
     lm_head = lm.lm_head.weight if hasattr(lm, "lm_head") and hasattr(lm.lm_head, "weight") \
         else inner.embed_tokens.weight
-    HEADS = ExitHeads(path, inner.config.hidden_size, inner.norm.weight, lm_head, device)
-    expect = tuple(getattr(inner, "h2o_exit_layers", ()))
-    if tuple(sorted(HEADS.layers)) != tuple(sorted(expect)):
-        raise ValueError(f"exit file layers {HEADS.layers} != model exit points {expect} "
-                         "(set VLLM_H2O_EXIT_LAYERS to match)")
+    with safe_meta(path) as meta:
+        layers = [int(x) for x in meta.get("layers", [])]
+    recon = {}
+    for k in layers:
+        layer = inner.layers[k]
+        attn = getattr(layer, "linear_attn", None)
+        if attn is None:
+            raise ValueError(f"exit k={k}: layer {k} is not a Gated DeltaNet layer")
+        n = _qkv_rows(attn)
+        w_qkv = attn.in_proj_qkvz.weight[:n].detach().float()        # [qkv, hidden]
+        ln = layer.input_layernorm.weight.detach().float() + 1.0      # [hidden]
+        recon[k] = (torch.linalg.pinv(w_qkv) / ln[:, None]).contiguous()   # [hidden, qkv]
+    HEADS = ExitHeads(path, inner.config.hidden_size, inner.norm.weight, lm_head, device, recon)
 
 
-def h2o_exit_point(hidden_states: torch.Tensor, residual: torch.Tensor, k: int,
-                   flag: torch.Tensor) -> None:
-    """Splitting op after layer k: decide the exit for the whole step."""
+class safe_meta:
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        from safetensors import safe_open
+        self.f = safe_open(self.path, "pt", device="cpu")
+        return json.loads((self.f.metadata() or {}).get("h2o_exits", "{}"))
+
+    def __exit__(self, *exc):
+        self.f = None
+        return False
+
+
+def gdn_hook(layer_idx: int, qkv: torch.Tensor) -> None:
+    """Called at the top of layer `layer_idx`'s Gated DeltaNet core op with the qkv
+    projection (the first qkv columns of the op's input). Decides the exit at
+    k = layer_idx for the whole step; raises H2OExit to end the pass."""
     st = STEP
-    if st is None or HEADS is None or k not in st.allowed:
+    if st is None or HEADS is None or layer_idx not in st.allowed:
         return
-    allow = st.allowed[k]
-    if not bool(allow.all()):
+    if not bool(st.allowed[layer_idx].all()):
         return
-    x = hidden_states[st.rows] + residual[st.rows]
-    hn = HEADS.normed(k, x)
-    agree = HEADS.agreement(k, hn, st.label_ids, st.temps)
-    st.tried.append(k)
-    if bool((agree >= st.tau[k]).all()):
-        flag.fill_(k)
-        raise H2OExit(k, hn.to(hidden_states.dtype))
-
-
-def _h2o_exit_point_fake(hidden_states, residual, k, flag) -> None:
-    return None
-
-
-direct_register_custom_op(
-    op_name="h2o_exit_point",
-    op_func=h2o_exit_point,
-    mutates_args=["flag"],
-    fake_impl=_h2o_exit_point_fake,
-)
+    r = HEADS.recon[layer_idx]
+    f = qkv[st.rows, : r.shape[1]].float()
+    x = f @ r.T                                    # x_k / rms(x_k)
+    hn = HEADS.normed(layer_idx, x)
+    agree = HEADS.agreement(layer_idx, hn, st.label_ids, st.temps)
+    st.tried.append(layer_idx)
+    if bool((agree >= st.tau[layer_idx]).all()):
+        raise H2OExit(layer_idx, hn.to(qkv.dtype))
