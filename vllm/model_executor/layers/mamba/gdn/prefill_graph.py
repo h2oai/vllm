@@ -152,6 +152,13 @@ class GDNPrefillGraphs:
         self._step_metadata = None
         self._step_bucket = None
         self._kv_bound.clear()
+        # a new private memory pool for the next captures: once every graph of
+        # a pool is destroyed, PyTorch keeps the pool's entry with a zero use
+        # count and refuses to capture into it again (INTERNAL ASSERT
+        # use_count > 0 in CachingHostAllocator), which would disable the
+        # graphs at the first real prefill after the profiling teardown
+        self.pool = None
+        self._stream = None
 
     @staticmethod
     def _kv_signature(layer) -> tuple | None:

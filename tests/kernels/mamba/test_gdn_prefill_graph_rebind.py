@@ -45,6 +45,8 @@ def _populate(reg: GDNPrefillGraphs, prefix: str) -> None:
     reg._fi_sizes[(32, 100, 8)] = 128
     reg._step_metadata = object()
     reg._step_bucket = object()
+    reg.pool = object()
+    reg._stream = object()
 
 
 def test_reset_forgets_every_capture_and_buffer():
@@ -65,6 +67,10 @@ def test_reset_forgets_every_capture_and_buffer():
     assert reg._step_metadata is None
     assert reg._step_bucket is None
     assert reg._kv_bound == {}
+    # a fresh pool (and its stream) for the next captures: PyTorch refuses to
+    # capture into a pool whose graphs were all destroyed
+    assert reg.pool is None
+    assert reg._stream is None
     # a reset is not a disablement: the next eligible prefill captures again
     assert reg.disabled_reason is None
 
