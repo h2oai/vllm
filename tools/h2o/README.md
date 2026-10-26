@@ -6,6 +6,9 @@ ways, on the same generate-mode engine that serves ordinary (causal) requests. I
 FlashAttention 4 on Hopper GPUs (the `FLASH_ATTN` backend), and the Gemma-4 KV-sharing fast prefill. Unflagged
 requests run exactly as in upstream vLLM.
 
+Every fork feature with its switch and default, and the engine settings we recommend per model and reading mode
+(with their measured effects): [SERVING.md](SERVING.md).
+
 The fork changes Python files only (no C++, CUDA or Rust), so its wheels are built without a CUDA compiler: the
 fork's Python over the compiled parts of the upstream v0.30.0 wheel (`VLLM_USE_PRECOMPILED=1`), on an ordinary CPU
 machine in a few minutes. `verify_wheel.py` then checks every file of the result against the upstream wheel: all
