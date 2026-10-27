@@ -1,7 +1,7 @@
 # The decision API inside the fork: `vllm serve <model> --h2o-decisions`
 
 Status: prototype on branch `h2o/decisions-endpoint` (off `b05cc29ab8`, h2o-v0.30.0.3). CPU-tested; never run against
-a GPU engine. Jon's goal (2026-10-26): "ideally our vllm fork can handle all shim stuff and the shim could go away in the
+a GPU engine. The goal (2026-10-26): "ideally our vllm fork can handle all shim stuff and the shim could go away in the
 limit of using it for on prem or as endpoint, while for cloud one might want still gateway to handle things."
 
 ## 1. What it does
@@ -104,7 +104,7 @@ questions batch in the engine as they do today. `SHIM_TIMEOUT` (180 s) bounds an
 | prompt render, label ids, temperatures, floor, readout, two-way flag and probes, Box, assets, images, state cut, usage | the shim beside the weights, one process per engine | the same shim, in the server process; one artifact `fork + package` | the gateway's `native_core` copy becomes unnecessary: it forwards `/v1/systemone` to the host's decision route and bills from `usage` |
 | warm-up and readiness | `serve.sh` | the layer, same bodies, `/health` 503 until passed | the prober reads the host's `/health` |
 | engine flags | `serve.sh` | package defaults applied to `vllm serve` | hosted lanes keep their own flags (`hosted_engine_differences.json`); `package_flags_test` compares them |
-| keys, rate limits, admission and queueing across hosts, routing by length / region / model, failover, spend and billing records, analytics, retention | - | not here | stays in the gateway (Jon 10-10: LiteLLM's workers and hooks carry load and analytics; multi-model logic lives in one place) |
+| keys, rate limits, admission and queueing across hosts, routing by length / region / model, failover, spend and billing records, analytics, retention | - | not here | stays in the gateway (the 2026-10-10 decision: the gateway's workers and hooks carry load and analytics; multi-model logic lives in one place) |
 | cross-model cascade (4B then 31B), second reads across models, degraded cross-model answers | - | not here (a same-model second read is the shim's) | the gateway orchestrates two host calls |
 | image URL fetch | the shim's safe fetch (off on hosts) | the shim's (`LIGHTNING_IMAGE_URLS=off` on hosts) | the gateway fetches and passes data URIs |
 | per-site live defaults (floor, state budget) | `SHIM_*` env, `kwargs` per request | the same env and request fields | request fields set by the gateway |
