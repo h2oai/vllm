@@ -1,7 +1,7 @@
 # The decision API inside the fork: `vllm serve <model> --h2o-decisions`
 
-Status: prototype on branch `h2o/decisions-endpoint` (off `b05cc29ab8`, h2o-v0.30.0.3). CPU-tested; never run against
-a GPU engine. The goal (2026-10-26): "ideally our vllm fork can handle all shim stuff and the shim could go away in the
+Status: branch `h2o/decisions-endpoint` (off `b05cc29ab8`, h2o-v0.30.0.3). CPU-tested, and GPU parity with the released
+shims measured on one RTX PRO 6000 96 GB (section 4.4). The goal (2026-10-26): "ideally our vllm fork can handle all shim stuff and the shim could go away in the
 limit of using it for on prem or as endpoint, while for cloud one might want still gateway to handle things."
 
 ## 1. What it does
@@ -133,7 +133,7 @@ Three layers of evidence, from CPU to GPU:
    over-context record, a malformed body, an unknown type), `/v1/decisions` and `/api/alpha/decisions`, the status
    and the body bytes must be identical. The engine dispatcher is tested separately against fake serving handlers
    (request models, `model_dump()` bodies, error shapes, the streaming refusal).
-3. **Same answers on the GPU (Opus, after this branch).** With one engine started once: (a) the released
+3. **Same answers on the GPU** (result: section 4.4). With one engine started once: (a) the released
    `serve.sh` path (engine + shim process) and (b) `vllm serve --h2o-decisions` must give identical JSON bodies on
    the kit's 600-question slice and on JB231 (two-way and one-way, batched and one at a time), with the KV size
    pinned as in `fork_exit_design.md` sections 9-11; the 4B card's JB231 206 and the 31B's 215 (gateway = shim
@@ -141,10 +141,53 @@ Three layers of evidence, from CPU to GPU:
    the warm-up, then 200 with the probe fields; latency c=1 and c=16 against `serve.sh` (the loopback hop goes
    away; the handler runs in-process).
 
+### 4.4 GPU parity result (2026-10-27, one RTX PRO 6000 Blackwell 96 GB)
+
+Setup:
+- One engine, two paths. B = `vllm serve <package> --h2o-decisions` with the package defaults only. A = the released shim
+  run standalone as `serve.sh` runs it, pointed at B's engine.
+- 833 bodies per run: 600 decision-index kit questions (seeded shuffle), JevBench's 231 public items, one image decision
+  and one Box question.
+- Runs in the order A, B, A again (A2), one at a time and at 16 in flight.
+- Compared: the full response JSON, ignoring only `usage.latency_ms` (wall time).
+
+The 4B rows ran with B as the on-prem image (the h2o-v0.30.0.3 release image with this branch over it, the package at
+its tag, `vllm serve ... --h2o-decisions`), and with A on the host. The 31B rows ran with B in the release image with
+this branch over it.
+
+| model, reading | one at a time: B vs A2 | 16 in flight: B vs A, max abs dp / flips (floor A vs A2) | JB231 A = B |
+|---|---|---|---|
+| 4B v1.4.1, two-way (default) | 715/833 byte-identical; the other 118 differ only in the last bits of the floats (max abs dp < 1e-6; the host's Python 3.10 vs the image's 3.12 in the shim's own arithmetic, the engine's log-probabilities equal) | 0.025 / 0 (0.025 / 0) | 205 = 205 (card 206) |
+| 4B v1.4.1, one-way (`"attention_mode": "causal"`) | 713/833, the same last-bit kind | 0.027 / 0 (0.020 / 1) | 201 = 201 (card 202) |
+| 31B v1.2.2, two-way (default; 96 GB class: context 131072, window 8192, util 0.92) | 832/833 (one row at dp 0) | 1e-5 / 0 (8e-6 / 0) | 214 = 214 (card 214) |
+| 31B v1.2.2, one-way deployment (`--no-h2o-decisions-two-way` vs `READING=one-way`; measured one build earlier, before the cancellation and load changes) | 833/833 | 0.085 / 0 (0.122 / 0) | 214 = 214 |
+
+The released 31B shim takes no per-request reading (its responses carry no `attention_mode`), hence the separate
+one-way deployment.
+
+Latency (A vs B) is unchanged:
+
+| model, reading | one at a time, p50 | 16 in flight |
+|---|---|---|
+| 4B two-way | 21.5 vs 21.4 ms | 47.4 vs 47.3 requests/s |
+| 4B one-way | | 130.3 vs 130.3 requests/s |
+| 31B two-way | 50 ms either way | 13.7 vs 13.7 requests/s |
+
+Startup: `/health` answered 503 `warming` from the layer's start until its warm-up passed, then 200 (4B image with a
+fresh compile cache: 152 s and 168 s after the container start).
+
+Client disconnect:
+- 4B: a 48-question decision on a long record (6.9 s to complete) was dropped 0.3 s into the engine's work. The layer
+  aborted its 41 in-flight engine reads, and vLLM's running and waiting counts were 0 within 58 ms.
+- 31B two-way: a 64-question decision (24-27 s to complete) was dropped 50 ms into the engine's work, three times. All
+  63-64 reads were aborted each time, and the counts were 0 within 1.15-1.17 s. That is one engine step at this load:
+  9,216-token chunked-prefill steps at the measured 7,300-7,500 prompt tokens/s are about 1.2 s each, and an aborted
+  request leaves the batch when the step in flight ends.
+
 ## 5. Open risks and what is not done
 
-- **GPU-untested.** `init_decisions_state` (the server hook), the engine dispatcher on real serving objects, the
-  31B's `warmup.py` replay and the one-engine probe through the in-process transport have only fake-engine tests.
+- **GPU coverage.** Section 4.4 covers the 4B and the 31B (default reading and one-way deployment) on one 96 GB GPU.
+  Not run on a GPU: the 31B profiles (`--h2o-decisions-profile`), the 80 GB sizing, `--api-server-count > 1`.
 - **`raw_request=None`.** The serving handlers get no Starlette request: request ids are generated and trace headers
   and `X-Request-Id` are absent. The decision routes themselves run under `with_cancellation` and `load_aware_call`
   (in vLLM's order), so a client disconnect cancels the decision's engine reads and, with
