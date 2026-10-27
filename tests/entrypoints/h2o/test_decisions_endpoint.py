@@ -13,10 +13,12 @@ import json
 import os
 import sys
 import threading
+import time
 import types
 import urllib.error
 import urllib.request
 from argparse import Namespace
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -677,6 +679,103 @@ def test_decision_routes_go_before_the_engines_health():
     assert r.status_code == 503 and r.json()["warming"] is True
     assert client.post("/v1/systemone", json={}).status_code == 503
     assert client.get("/h2o/decisions").status_code == 503
+
+
+# ---------------------------------------------------------------- cancellation
+def test_a_cancelled_decision_aborts_its_engine_reads(loop_thread, tmp_path):
+    """The client drops the request: every engine read of the decision in flight
+    is cancelled (vLLM's handler sees CancelledError and aborts the request),
+    later reads of that decision are refused, and the shim's threads finish."""
+    from vllm.entrypoints.h2o.transport import (
+        CURRENT_DECISION,
+        DecisionCancelled,
+        DecisionContext,
+    )
+
+    started, saw_cancel = threading.Event(), threading.Event()
+
+    class SlowCompletion:
+        async def create_completion(self, request, raw_request):
+            started.set()
+            try:
+                await asyncio.sleep(60)  # a long read
+            except asyncio.CancelledError:
+                saw_cancel.set()
+                raise
+
+    state = types.SimpleNamespace(openai_serving_completion=SlowCompletion())
+    dispatcher = EngineDispatcher(state, loop_thread, timeout=30)
+    pool = D.ContextExecutor(max_workers=2)  # as the layer gives each shim
+    outcome = {}
+
+    class ShimLike(BaseHTTPRequestHandler):
+        """Submits its reads to a question pool, as the shims do, and answers
+        502 when a read fails."""
+
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            body = {"model": "m", "prompt": "x", "max_tokens": 1}
+            fut = pool.submit(dispatcher.call, "POST", "/v1/completions", body)
+            try:
+                fut.result()
+                code, out = 200, {"ok": True}
+            except DecisionCancelled as e:
+                code, out = 502, {"detail": str(e)}
+            outcome["code"] = code
+            payload = json.dumps(out).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    pkg = _pkg(tmp_path, "h2o_lightning_shim.py", CFG_4B)
+    layer = D.DecisionsLayer(
+        package=pkg,
+        module=types.ModuleType("none"),
+        handler_cls=ShimLike,
+        bridge=HandlerBridge(ShimLike),
+        executor=ThreadPoolExecutor(max_workers=2),
+        ready_file=None,
+        dispatcher=dispatcher,
+        http_vllm_cls=object,
+        two_way=False,
+        profile=None,
+    )
+    decision = DecisionContext()
+    request = asyncio.run_coroutine_threadsafe(
+        layer.respond_async(
+            loop_thread, "POST", "/v1/systemone", [], b"{}", context=decision
+        ),
+        loop_thread,
+    )
+    assert started.wait(10), "the engine read did not start"
+    assert request.cancel()  # the client dropped the request
+    assert saw_cancel.wait(10), "the engine read was not cancelled"
+    assert decision.cancelled
+    deadline = time.monotonic() + 10
+    while "code" not in outcome and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert outcome.get("code") == 502  # the shim's thread finished with a 502
+    # a later read of the same decision is refused at once
+    token = CURRENT_DECISION.set(decision)
+    try:
+        with pytest.raises(DecisionCancelled):
+            dispatcher.call("POST", "/v1/completions", {"model": "m", "prompt": "y"})
+    finally:
+        CURRENT_DECISION.reset(token)
+    # the pool carries the context; a plain pool would not
+    token = CURRENT_DECISION.set(decision)
+    try:
+        assert pool.submit(CURRENT_DECISION.get).result() is decision
+        assert (
+            ThreadPoolExecutor(max_workers=1).submit(CURRENT_DECISION.get).result()
+            is None
+        )
+    finally:
+        CURRENT_DECISION.reset(token)
 
 
 # ---------------------------------------------------------------- parity with the released shims

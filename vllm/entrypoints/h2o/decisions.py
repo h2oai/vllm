@@ -4,19 +4,29 @@
 served in-process.
 
 ``start_layer`` imports the shim module from the package directory, swaps its
-``VLLM`` class for the in-process transport and its ``Server`` class for a
-stand-in that only keeps the request handler, and runs the shim's ``main()``
+``VLLM`` class for the in-process transport, its ``Server`` class for a
+stand-in that only keeps the request handler and its ``Shim`` class for a
+subclass that records the instances (their question pools then carry the
+decision context, see cancellation below), and runs the shim's ``main()``
 with the arguments ``serve.sh`` passes. Everything ``main()`` does (the
 contract from ``serve_config*.json``, the profile checks of the 31B, the
 one-engine two-way flag, the start-up engine check) happens as in the released
 package. The handler then answers in-memory requests (``bridge.py``) behind the
 server's routes (``api_router.py``), and the warm-up ``serve.sh`` runs before it
 reports ready is replayed here before ``/health`` turns 200.
+
+Cancellation: a decision answered through ``respond_async`` runs under a
+``DecisionContext``; when the awaiting route is cancelled (the client dropped
+the request), every engine read of that decision in flight is cancelled and
+the shim's remaining reads are refused, so a gateway that starts the 4B and
+the 31B together and drops the 31B once the 4B is confident stops the 31B's
+work within an engine step.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import importlib.util
 import json
@@ -34,7 +44,13 @@ from vllm.logger import init_logger
 
 from .bridge import BridgeResponse, HandlerBridge
 from .package import Package, locate_package
-from .transport import INPROCESS_URL, EngineDispatcher, make_inprocess_vllm
+from .transport import (
+    CURRENT_DECISION,
+    INPROCESS_URL,
+    DecisionContext,
+    EngineDispatcher,
+    make_inprocess_vllm,
+)
 
 logger = init_logger(__name__)
 
@@ -45,6 +61,16 @@ WARMUP_PNG = (
     "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAT0lEQVR42u3PQQ0AAAgEILV/"
     "sItlCh9u0IBOUp9NPScgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBwbwFY4wLYRBP0hgAAAABJRU5ErkJggg=="
 )
+
+
+class ContextExecutor(ThreadPoolExecutor):
+    """A thread pool whose tasks run under the submitter's context variables
+    (``CURRENT_DECISION``): the shims' question pools, so that every engine
+    call of a decision, from whichever thread, belongs to that decision."""
+
+    def submit(self, fn, /, *args, **kwargs):  # type: ignore[override]
+        ctx = contextvars.copy_context()
+        return super().submit(ctx.run, fn, *args, **kwargs)
 
 
 @dataclass
@@ -59,6 +85,7 @@ class DecisionsLayer:
     http_vllm_cls: type  # the shim's own HTTP transport class (kept for tests)
     two_way: bool
     profile: str | None
+    shims: list[Any] = field(default_factory=list)  # the Shim instances main() built
     warmup: dict[str, Any] = field(
         default_factory=lambda: {"state": "pending", "steps": [], "error": None}
     )
@@ -76,10 +103,30 @@ class DecisionsLayer:
         target: str,
         headers: Any = None,
         body: bytes = b"",
+        context: DecisionContext | None = None,
     ) -> BridgeResponse:
-        return await loop.run_in_executor(
-            self.executor, self.respond, method, target, headers, body
-        )
+        """Answer one request on the layer's thread pool under a decision
+        context; when this coroutine is cancelled, the decision's engine
+        calls are cancelled with it."""
+        decision = context or DecisionContext()
+        token = CURRENT_DECISION.set(decision)
+        try:
+            copied = contextvars.copy_context()
+        finally:
+            CURRENT_DECISION.reset(token)
+        try:
+            return await loop.run_in_executor(
+                self.executor, copied.run, self.respond, method, target, headers, body
+            )
+        except asyncio.CancelledError:
+            n = decision.cancel()
+            logger.info(
+                "h2o decisions: %s %s cancelled by the client; %d engine read(s) aborted",
+                method,
+                target.split("?", 1)[0],
+                n,
+            )
+            raise
 
     def post_json(self, path: str, obj: Any) -> BridgeResponse:
         return self.bridge.respond_json("POST", path, obj)
@@ -114,11 +161,13 @@ def shim_argv(
     port is unused in-process; the engine URL is the in-process marker)."""
     argv = ["--config", package.config_path, "--port", "0"]
     if package.family == "4b":
-        # serve.sh: --config serve_config.json --model-dir $MODEL --port $PORT --vllm http://127.0.0.1:$VLLM_PORT
+        # serve.sh: --config serve_config.json --model-dir $MODEL --port $PORT
+        #   --vllm http://127.0.0.1:$VLLM_PORT
         argv += ["--model-dir", package.dir, "--vllm", INPROCESS_URL]
         return argv
-    # 31B serve.sh: --config $CONFIG --vllm URL --port $PORT --tokenizer $MODEL/tokenizer.json [--config-two-way
-    # serve_config_two_way.json --two-way-reading | --profile NAME]
+    # 31B serve.sh: --config $CONFIG --vllm URL --port $PORT --tokenizer
+    #   $MODEL/tokenizer.json [--config-two-way serve_config_two_way.json
+    #   --two-way-reading | --profile NAME]
     argv += ["--vllm", INPROCESS_URL]
     tokenizer = package.file("tokenizer.json")
     if tokenizer:
@@ -150,9 +199,8 @@ def shim_environment(
         # one engine of the per-request attention build: the flag serves both readings
         env["SHIM_TWO_WAY_FLAG"] = "1"
         if not two_way:
-            env["SHIM_ATTENTION_MODE"] = (
-                "causal"  # TWO_WAY=0: the one engine answering one-way by default
-            )
+            # TWO_WAY=0: the one engine answering one-way by default
+            env["SHIM_ATTENTION_MODE"] = "causal"
     elif two_way and not profile and two_way_window:
         env["SHIM_TWO_WAY_WINDOW"] = str(int(two_way_window))
     return env
@@ -173,7 +221,7 @@ def load_shim_module(package: Package) -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
-    for attr in ("VLLM", "Server", "main", "make_handler", "UpstreamError"):
+    for attr in ("VLLM", "Server", "Shim", "main", "make_handler", "UpstreamError"):
         if not hasattr(module, attr):
             raise RuntimeError(
                 f"{package.entry} has no {attr}: not a shim this layer can serve"
@@ -207,6 +255,30 @@ def _capture_server(captured: list[Any]) -> type:
     return CaptureServer
 
 
+def _capture_shim(base: type, captured: list[Any]) -> type:
+    """A subclass of the shim's ``Shim`` that records each instance ``main()``
+    builds and gives it a context-propagating question pool (the shims make
+    ``self.pool`` a ``ThreadPoolExecutor`` and submit every read to it)."""
+
+    class CapturedShim(base):  # type: ignore[misc,valid-type]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            pool = getattr(self, "pool", None)
+            if isinstance(pool, ThreadPoolExecutor) and not isinstance(
+                pool, ContextExecutor
+            ):
+                pool.shutdown(wait=False)
+                self.pool = ContextExecutor(
+                    max_workers=pool._max_workers,
+                    thread_name_prefix="h2o-shim-question",
+                )
+            captured.append(self)
+
+    CapturedShim.__name__ = base.__name__
+    CapturedShim.__qualname__ = base.__qualname__
+    return CapturedShim
+
+
 def start_layer(
     package: Package,
     dispatcher: Any,
@@ -233,17 +305,19 @@ def start_layer(
     module = load_shim_module(package)
     http_vllm_cls = module.VLLM
     module.VLLM = make_inprocess_vllm(module, dispatcher)
-    captured: list[Any] = []
-    module.Server = _capture_server(captured)
+    captured_servers: list[Any] = []
+    module.Server = _capture_server(captured_servers)
+    captured_shims: list[Any] = []
+    module.Shim = _capture_shim(module.Shim, captured_shims)
     try:
         module.main(argv if argv is not None else shim_argv(package, two_way, profile))
     except SystemExit as e:
         raise RuntimeError(
             f"the package shim refused to start (exit {e.code}); its message is in the log above"
         ) from e
-    if not captured:
+    if not captured_servers:
         raise RuntimeError("the shim's main() returned without building its server")
-    handler_cls = captured[-1].handler_cls
+    handler_cls = captured_servers[-1].handler_cls
     threads = request_threads or int(os.environ.get("SHIM_REQUEST_THREADS", "64"))
     return DecisionsLayer(
         package=package,
@@ -258,6 +332,7 @@ def start_layer(
         http_vllm_cls=http_vllm_cls,
         two_way=two_way,
         profile=profile,
+        shims=captured_shims,
     )
 
 
@@ -277,20 +352,15 @@ def warm_up_bodies_4b(
     for mode in modes:
         tag = {"attention_mode": mode} if mode else {}
         label = mode or "default mode"
+        yes_no = {
+            "type": "noul",
+            "instructions": "Is this a warm-up?",
+            "criteria": {"true": "yes", "false": "no"},
+        }
         out.append(
             (
                 f"yes/no ({label})",
-                {
-                    **tag,
-                    "state": "warm-up",
-                    "questions": {
-                        "d": {
-                            "type": "noul",
-                            "instructions": "Is this a warm-up?",
-                            "criteria": {"true": "yes", "false": "no"},
-                        }
-                    },
-                },
+                {**tag, "state": "warm-up", "questions": {"d": yes_no}},
             )
         )
         out.append(
@@ -342,13 +412,7 @@ def warm_up_bodies_4b(
                     {
                         **tag,
                         "state": {"images": [WARMUP_PNG], "note": "warm-up"},
-                        "questions": {
-                            "d": {
-                                "type": "noul",
-                                "instructions": "Is this a warm-up?",
-                                "criteria": {"true": "yes", "false": "no"},
-                            }
-                        },
+                        "questions": {"d": yes_no},
                     },
                 )
             )
@@ -528,8 +592,9 @@ async def init_decisions_state(state: Any, args: Any) -> DecisionsLayer:
         daemon=True,
     ).start()
     logger.info(
-        "h2o decisions: %s %s (%s) served at /v1/decisions, /v1/systemone, /api/alpha/decisions; "
-        "/health is the shim's (503 until the warm-up passes), /health/engine the engine's",
+        "h2o decisions: %s %s (%s) served at /v1/decisions, /v1/systemone, "
+        "/api/alpha/decisions; /health is the shim's (503 until the warm-up passes), "
+        "/health/engine the engine's",
         package.model,
         package.known["tag"] if package.known else "unpinned",
         package.entry,

@@ -10,13 +10,22 @@ HTTP connection; every other method of that class (``post``, ``refuse``,
 ``call``: the request goes to this server's serving handlers, the reply is the
 JSON the matching route would have sent. The shim's logic above ``call`` is the
 shipped code, untouched.
+
+Cancellation: every engine call made while a decision is being answered is
+registered on that decision's ``DecisionContext`` (carried by a context
+variable into the shim's question threads). When the client drops the
+request, the route cancels the context: the in-flight engine reads are
+cancelled (vLLM aborts them) and new ones are refused.
 """
 
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import contextvars
 import inspect
 import json
+import threading
 from http import HTTPStatus
 from types import ModuleType
 from typing import Any
@@ -27,6 +36,50 @@ logger = init_logger(__name__)
 
 # what the shim is told its engine is (its URL parser accepts any scheme)
 INPROCESS_URL = "inprocess://engine"
+
+
+class DecisionCancelled(RuntimeError):
+    """The decision this engine call belongs to was cancelled (its client
+    dropped the request)."""
+
+
+class DecisionContext:
+    """The engine calls of one decision, cancellable as a group."""
+
+    def __init__(self) -> None:
+        self.cancelled = False
+        self._futures: set[concurrent.futures.Future] = set()
+        self._lock = threading.Lock()
+
+    def register(self, future: concurrent.futures.Future) -> None:
+        with self._lock:
+            if self.cancelled:
+                future.cancel()
+                return
+            self._futures.add(future)
+            future.add_done_callback(self._forget)
+
+    def _forget(self, future: concurrent.futures.Future) -> None:
+        with self._lock:
+            self._futures.discard(future)
+
+    def cancel(self) -> int:
+        """Cancel every in-flight engine call; later calls are refused.
+        Returns how many were in flight."""
+        with self._lock:
+            self.cancelled = True
+            pending = list(self._futures)
+        for f in pending:
+            f.cancel()
+        return len(pending)
+
+
+# the decision an engine call belongs to: set by the layer for the thread that
+# answers a request, copied into the shim's question threads by the context-
+# propagating pool the layer gives each shim
+CURRENT_DECISION: contextvars.ContextVar[DecisionContext | None] = (
+    contextvars.ContextVar("h2o_current_decision", default=None)
+)
 
 
 def wire_json(content: Any) -> Any:
@@ -59,7 +112,10 @@ class EngineDispatcher:
     """
 
     def __init__(
-        self, state: Any, loop: asyncio.AbstractEventLoop, timeout: float | None = None
+        self,
+        state: Any,
+        loop: asyncio.AbstractEventLoop,
+        timeout: float | None = None,
     ):
         self.state = state
         self.loop = loop
@@ -75,10 +131,22 @@ class EngineDispatcher:
             raise RuntimeError(
                 "EngineDispatcher.call blocks: it must not run on the server's event loop"
             )
+        decision = CURRENT_DECISION.get(None)
+        if decision is not None and decision.cancelled:
+            raise DecisionCancelled(
+                "the decision was cancelled: its client dropped the request"
+            )
         future = asyncio.run_coroutine_threadsafe(
             self.dispatch(method, path, body), self.loop
         )
-        return future.result(self.timeout)
+        if decision is not None:
+            decision.register(future)
+        try:
+            return future.result(self.timeout)
+        except concurrent.futures.CancelledError as e:
+            raise DecisionCancelled(
+                "the decision was cancelled: its client dropped the request"
+            ) from e
 
     # ---- the server's side (the event loop)
     async def dispatch(
@@ -90,6 +158,8 @@ class EngineDispatcher:
             return 404, {"detail": "Not Found"}
         try:
             return await handler(body)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:  # the routes' exception handlers, in order
             return self._error(e)
 
@@ -204,6 +274,11 @@ class BridgeDispatcher:
         self.bridge = HandlerBridge(handler_cls)
 
     def call(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        decision = CURRENT_DECISION.get(None)
+        if decision is not None and decision.cancelled:
+            raise DecisionCancelled(
+                "the decision was cancelled: its client dropped the request"
+            )
         if body is None:
             r = self.bridge.respond(method, path)
         else:
@@ -216,8 +291,9 @@ class BridgeDispatcher:
 
 def make_inprocess_vllm(shim_module: ModuleType, dispatcher: Any) -> type:
     """A subclass of the shim's ``VLLM`` whose ``call`` goes through
-    ``dispatcher`` (no socket). Failures of the dispatcher itself are the
-    shim's ``UpstreamError`` (a 502), as an unreachable engine would be."""
+    ``dispatcher`` (no socket). Failures of the dispatcher itself, and a
+    cancelled decision, are the shim's ``UpstreamError`` (a 502), as an
+    unreachable engine would be."""
     base = shim_module.VLLM
     upstream_error = shim_module.UpstreamError
 
@@ -233,6 +309,8 @@ def make_inprocess_vllm(shim_module: ModuleType, dispatcher: Any) -> type:
                 return dispatcher.call(method, path, body)
             except upstream_error:
                 raise
+            except DecisionCancelled as e:
+                raise upstream_error(str(e)) from e
             except Exception as e:
                 raise upstream_error(
                     f"vLLM in-process {method} {path} failed: {type(e).__name__}: {e}"

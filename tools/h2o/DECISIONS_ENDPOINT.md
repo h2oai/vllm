@@ -158,7 +158,52 @@ Three layers of evidence, from CPU to GPU:
 - **Shutdown.** The layer's threads are daemon threads; an in-flight decision at shutdown is dropped like an
   in-flight request of the shim is.
 
-## 6. Files
+## 6. Place in the migration (ARCHITECTURE_LAYERS.md section 6, open-system-one, 2026-10-26)
+
+This branch is **M1** of the migration M0-M4: the fork's native decisions endpoint at parity with the released package
+shim, model by model. M1's gate is JB231 item by item identical to the package shim on the same engine in both read
+modes (4B 206 two-way / 202 one-way on v1.4.1; 31B 215 two-way), the package's `test_shim.py` cases carried by the
+fork's tests, and Box, images, never-fail and `usage.input_tokens` = the full input. Section 4 above is how the CPU
+part of that gate is met today (the package's own stand-in engine, the released shim standalone vs in-process, byte
+for byte); the GPU part is section 4.3. M2 (the package `serve.sh` gains the native path), M3 (the gateway forwards
+decisions to the host's endpoint and bills from `usage`) and M4 (the gateway's readout code deleted) build on it.
+
+The three open items of that plan, as this layer answers them:
+
+**Lanes by length (hosted US: a short and a long engine on one GPU).** The layer serves one engine, like the package
+shim; a lane is one `vllm serve --h2o-decisions` with its own `--max-model-len`. Routing stays the gateway's, by
+request size, as today. What the endpoint gives it: `/health` reports `vllm_max_model_len` (the shim's field) and
+`GET /h2o/decisions` the package's state budget, so the gateway knows each lane's capacity; a request over the lane's
+context is answered as the shim answers it, HTTP 422 with the shim's "over the server's context limit" text (the
+`_CONTEXT_ERROR` match on vLLM's error), which the gateway can re-route to the long lane at the cost of one failed
+prefill attempt, or avoid with its size estimate. On the short lane the package's state budget (32,000 tokens on the
+4B) is left as shipped: a long record must reach the long lane whole, not be cut on the short one (the cut is the
+long lane's job and changes the answer). One engine per GPU per model, as the package runs, needs no routing at all.
+
+**Cascade cancel (the 2026-10-16 form: start the 4B and the 31B together, drop the 31B when the 4B is confident).**
+Implemented in this layer. A decision runs under a `DecisionContext`; every engine call the shim makes for it, from
+whichever of its question threads (the shims' `ThreadPoolExecutor` is swapped for one that carries the context),
+is registered on that context. The routes read the body and then run under vLLM's `with_cancellation`, which
+listens for the client's disconnect; when it fires, the route's task is cancelled, the layer cancels the context,
+every in-flight engine read is cancelled (vLLM's handler sees `CancelledError`, answers "Client disconnected" and the
+engine aborts the request at the next step), later reads of that decision are refused before they reach the engine,
+and the shim's threads finish with a 502 nobody reads. So the gateway cancels the 31B by closing its HTTP request,
+which is what LiteLLM does when its own caller is done. Test: `test_a_cancelled_decision_aborts_its_engine_reads`.
+To measure on the GPU (M3): a long 31B read cancelled after 50 ms must leave `vllm:num_requests_running` at 0 within
+a step and cost no more than that step.
+
+**API-server capacity.** The shim's CPU work (render, BM25, JSON) now shares the API server's process and its GIL
+with vLLM's own front end (tokenisation, response building), where the standalone shim had its own process; the
+loopback HTTP hop, its JSON round trip and the N per-question socket calls go away. Which wins is a measurement:
+decisions/s and p50 at c = 1 / 8 / 32 for 1- and 3-question requests, `vllm serve --h2o-decisions` vs `serve.sh`
+(engine + shim process) on one engine, and the API-server process CPU. If one process binds, vLLM 0.30's
+`--api-server-count N` runs N API server processes over one engine: each process builds its own layer, runs its own
+warm-up (N times the warm-up requests, once per process) and keeps its own readiness file, which is correct but
+should be known; the engine batches across them as across any clients. That is the knob to try before any
+restructuring; the M3 measurement of ARCHITECTURE_LAYERS.md section 5.3 (c=1 and 3-question p50, saturation, CPU on
+the host) is the gate.
+
+## 7. Files
 
 - `vllm/entrypoints/h2o/{__init__,bridge,package,transport,decisions,api_router,engine_defaults}.py`
 - `vllm/entrypoints/launchers/cli_args.py` (`--h2o-decisions`, `--h2o-decisions-package`, `--[no-]h2o-package-defaults`,
