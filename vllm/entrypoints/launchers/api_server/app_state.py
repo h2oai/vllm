@@ -158,3 +158,10 @@ async def init_app_state(
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
+
+    if getattr(args, "h2o_decisions", False):
+        # H2O: the model package's decision API (its shim, in this process), once
+        # the serving handlers it calls exist
+        from vllm.entrypoints.h2o.decisions import init_decisions_state
+
+        await init_decisions_state(state, args)

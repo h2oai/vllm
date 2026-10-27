@@ -15,6 +15,14 @@ def register_api_routers(
     supported_tasks: tuple["SupportedTask", ...],
     model_config: ModelConfig | None = None,
 ):
+    if getattr(args, "h2o_decisions", False):
+        # H2O: the package's decision routes first, so its /health (the shim's,
+        # 503 until warm) takes precedence over the engine's; the engine's own
+        # check moves to /health/engine
+        from vllm.entrypoints.h2o.api_router import attach_router as attach_h2o_router
+
+        attach_h2o_router(app)
+
     from vllm.entrypoints.serve import register_vllm_serve_api_routers
 
     register_vllm_serve_api_routers(app)

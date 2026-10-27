@@ -181,6 +181,14 @@ async def run_server_worker(
 ) -> None:
     """Run a single API server worker."""
 
+    if getattr(args, "h2o_decisions", False):
+        # H2O: the model package's engine settings (its serve.sh) for the
+        # arguments the command line left at vLLM's default, before the engine
+        # is built; the package files are fetched here when needed
+        from vllm.entrypoints.h2o.engine_defaults import apply_package_defaults_to_args
+
+        apply_package_defaults_to_args(args)
+
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
         ToolParserManager.import_tool_parser(args.tool_parser_plugin)
 

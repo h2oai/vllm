@@ -200,6 +200,28 @@ class BaseFrontendArgs:
     """
     fingerprint_value: str | None = None
     """Literal fingerprint string used when ``--fingerprint-mode=custom``."""
+    h2o_decisions: bool = False
+    """H2O: serve the model package's decision API (/v1/decisions, /v1/systemone,
+    /api/alpha/decisions, /health) in this server, from the shim and
+    serve_config*.json shipped in the model repository. See
+    tools/h2o/DECISIONS_ENDPOINT.md."""
+    h2o_decisions_package: str | None = None
+    """H2O: the package directory (default: the model directory, or the model
+    repository's package files fetched from the Hub)."""
+    h2o_package_defaults: bool = True
+    """H2O: with --h2o-decisions, apply the package's engine settings (its
+    serve.sh: served model name, tokenizer, attention backend, step budget,
+    image limits) to the arguments left at vLLM's default."""
+    h2o_decisions_two_way: bool = True
+    """H2O: serve the two-way reading by default (the package default); off
+    answers one-way by default (serve.sh TWO_WAY=0 / READING=one-way)."""
+    h2o_decisions_profile: str | None = None
+    """H2O: the 31B shim profile to serve (decision-index, decision-index-max,
+    two-way); default: the package's serve.sh without a profile."""
+    h2o_decisions_two_way_window: int | None = None
+    """H2O: the 31B's largest prompt read two-way (serve.sh TWO_WAY_WINDOW, the
+    shim's SHIM_TWO_WAY_WINDOW); the measured sizes apply by GPU class when
+    unset."""
 
     @classmethod
     def _customize_cli_kwargs(
