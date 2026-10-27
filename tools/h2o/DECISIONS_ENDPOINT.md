@@ -79,8 +79,13 @@ Three pieces, each small and testable without a GPU:
 argument the command line leaves at vLLM's default (`engine_defaults.py`, applied before the engine is built;
 `--no-h2o-package-defaults` turns it off). 4B: `--served-model-name`, `--tokenizer <package>/tokenizer`,
 `--max-model-len 40960`, `--attention-backend TRITON_ATTN`, `--max-num-batched-tokens 40960` (a two-way prompt is
-prefilled whole; 8192 one-way), `--limit-mm-per-prompt`, `--mm-processor-kwargs max_pixels`, `--mm-processor-cache-gb
-0`, and the environment `VLLM_USE_FLASHINFER_SAMPLER=0`, `VLLM_GDN_PREFILL_GRAPH_PRECAPTURE=1`. 31B: `--max-logprobs
+prefilled whole), `--max-cudagraph-capture-size 512` (2048 one-way), `--allowed-media-domains media.invalid`,
+`--limit-mm-per-prompt`, `--mm-processor-kwargs max_pixels`, `--mm-processor-cache-gb 0`, and the environment `VLLM_USE_FLASHINFER_SAMPLER=0`, `VLLM_GDN_PREFILL_GRAPH_PRECAPTURE=1`.
+`--no-h2o-decisions-two-way` is serve.sh's `ONE_ENGINE=1 TWO_WAY=0`: the same one engine (TRITON, a step budget of the
+whole context), answering one-way by default; only the step graphs grow to 2048. The step-graph size is explicit
+because vLLM's own default is 1024 on compute capability 10.x. `--allowed-media-domains media.invalid` is serve.sh's
+setting; it matters more here because vLLM's own routes share the public port, so its chat route must not fetch URLs
+for a caller (the shim fetches image links with its own checks; the 31B gets the flag too). 31B: `--max-logprobs
 20`, `--dtype bfloat16`, `--quantization fp8`, the image limits with `max_soft_tokens 560`, and for the two-way reading
 `--attention-backend TRITON_ATTN`, `--max-num-seqs 1024` and the measured sizes by GPU memory class (80 GB: context
 81920, window 16384; 96 GB: 131072 / 8192; another GPU: pass `--max-model-len` and `--h2o-decisions-two-way-window`),
@@ -95,7 +100,8 @@ compile cache per engine configuration as the packages do.
 
 **Threads.** A decision runs on the layer's thread pool (`SHIM_REQUEST_THREADS`, 64); the shim fans its questions out on
 its own pool (`SHIM_QUESTION_THREADS`, 64); every engine call is a coroutine on the server's loop, so concurrent
-questions batch in the engine as they do today. `SHIM_TIMEOUT` (180 s) bounds an engine call as in the shim.
+questions batch in the engine as they do today. `SHIM_TIMEOUT` (180 s) bounds an engine call as in the shim; a call
+that reaches it is also cancelled in the engine (the shim has given up on it).
 
 ## 3. What moves into the fork, what stays in the gateway
 
@@ -139,10 +145,11 @@ Three layers of evidence, from CPU to GPU:
 
 - **GPU-untested.** `init_decisions_state` (the server hook), the engine dispatcher on real serving objects, the
   31B's `warmup.py` replay and the one-engine probe through the in-process transport have only fake-engine tests.
-- **`raw_request=None`.** The serving handlers get no Starlette request: request ids are generated, trace headers
-  and `X-Request-Id` are absent, the `with_cancellation` / `load_aware_call` decorators of the HTTP routes do not run
-  (no client-disconnect cancellation of an in-flight read; the server-load metric does not count decisions). The
-  shim's own `/v1/models` body (`"readout": ...`) is not served; vLLM's is.
+- **`raw_request=None`.** The serving handlers get no Starlette request: request ids are generated and trace headers
+  and `X-Request-Id` are absent. The decision routes themselves run under `with_cancellation` and `load_aware_call`
+  (in vLLM's order), so a client disconnect cancels the decision's engine reads and, with
+  `--enable-server-load-tracking`, decisions count in the server-load metric. The shim's own `/v1/models` body
+  (`"readout": ...`) is not served; vLLM's is.
 - **Validation errors** are rendered as `400` with an `error` object; the message text differs from the HTTP
   validation handler's. The shims only pattern-match context-limit errors (`_CONTEXT_ERROR`), which come from the
   serving layer with the same text.

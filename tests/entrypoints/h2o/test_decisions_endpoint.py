@@ -25,6 +25,7 @@ import pytest
 
 from vllm.entrypoints.h2o import decisions as D
 from vllm.entrypoints.h2o.bridge import (
+    BridgeResponse,
     HandlerBridge,
     build_request_bytes,
     parse_response_bytes,
@@ -507,15 +508,16 @@ def test_engine_defaults_4b(tmp_path):
         "limit_mm_per_prompt": {"image": 4, "video": 0},
         "mm_processor_kwargs": {"max_pixels": 1048576},
         "mm_processor_cache_gb": 0,
+        "max_cudagraph_capture_size": 512,
+        "allowed_media_domains": ["media.invalid"],
     }
     assert d.env == {
         "VLLM_USE_FLASHINFER_SAMPLER": "0",
         "VLLM_GDN_PREFILL_GRAPH_PRECAPTURE": "1",
     }
-    assert (
-        package_engine_defaults(pkg, two_way=False).args["max_num_batched_tokens"]
-        == 8192
-    )
+    # one-way = serve.sh ONE_ENGINE=1 TWO_WAY=0: the one engine, step graphs to 2048
+    one_way = package_engine_defaults(pkg, two_way=False).args
+    assert one_way == dict(d.args, max_cudagraph_capture_size=2048)
     # applied to the arguments left at vLLM's default; the command line wins
     args = Namespace(
         served_model_name=None,
@@ -560,6 +562,7 @@ def test_engine_defaults_31b(tmp_path):
         "limit_mm_per_prompt": {"image": 4, "video": 0},
         "mm_processor_kwargs": {"max_soft_tokens": 560},
         "max_model_len": 131072,
+        "allowed_media_domains": ["media.invalid"],
     }
     d = package_engine_defaults(pkg, two_way=True, gpu_mib=81559)
     assert (
@@ -776,6 +779,87 @@ def test_a_cancelled_decision_aborts_its_engine_reads(loop_thread, tmp_path):
         )
     finally:
         CURRENT_DECISION.reset(token)
+
+
+def test_a_timed_out_engine_read_is_cancelled(loop_thread):
+    """SHIM_TIMEOUT: the shim gives up on a read; the engine stops it too."""
+    started, saw_cancel = threading.Event(), threading.Event()
+
+    class SlowCompletion:
+        async def create_completion(self, request, raw_request):
+            started.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                saw_cancel.set()
+                raise
+
+    state = types.SimpleNamespace(openai_serving_completion=SlowCompletion())
+    dispatcher = EngineDispatcher(state, loop_thread, timeout=0.3)
+    with pytest.raises(TimeoutError):
+        dispatcher.call("POST", "/v1/completions", {"model": "m", "prompt": "x"})
+    assert started.is_set() and saw_cancel.wait(10)
+
+
+def _route_request(layer, receive, tracking=True):
+    app = types.SimpleNamespace(
+        state=types.SimpleNamespace(
+            h2o_decisions=layer,
+            enable_server_load_tracking=tracking,
+            server_load_metrics=0,
+        )
+    )
+
+    async def body():
+        return b"{}"
+
+    return types.SimpleNamespace(
+        app=app,
+        method="POST",
+        url=types.SimpleNamespace(path="/v1/systemone", query=""),
+        headers={"content-type": "application/json"},
+        body=body,
+        receive=receive,
+    )
+
+
+def test_the_decision_route_cancels_on_disconnect_and_counts_load():
+    """Through the route: a client that stays gets the shim's reply; one that
+    disconnects cancels the layer's work. With server-load tracking on, the
+    metric returns to 0 either way (load_aware_call inside with_cancellation, as
+    on vLLM's routes)."""
+    from vllm.entrypoints.h2o import api_router
+
+    class Layer:
+        def __init__(self, delay):
+            self.delay, self.cancelled, self.load_seen = delay, False, None
+
+        async def respond_async(self, loop, method, target, headers, body):
+            self.load_seen = request.app.state.server_load_metrics
+            try:
+                await asyncio.sleep(self.delay)
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+            return BridgeResponse(200, [("Content-Type", "application/json")], b"{}")
+
+    async def stays():
+        await asyncio.sleep(3600)
+
+    async def leaves():
+        await asyncio.sleep(0.1)
+        return {"type": "http.disconnect"}
+
+    layer = Layer(delay=0.05)
+    request = _route_request(layer, stays)
+    r = asyncio.run(api_router._through_shim(request))
+    assert (r.status_code, r.body) == (200, b"{}") and not layer.cancelled
+    assert layer.load_seen == 1 and request.app.state.server_load_metrics == 0
+    layer = Layer(delay=30)
+    request = _route_request(layer, leaves)
+    r = asyncio.run(api_router._through_shim(request))
+    assert layer.cancelled and r.status_code == 503
+    assert layer.load_seen == 1 and request.app.state.server_load_metrics == 0
 
 
 # ---------------------------------------------------------------- parity with the released shims

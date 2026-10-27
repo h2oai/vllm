@@ -11,7 +11,10 @@ goes before the engine's health route; the engine's own check stays at
 
 A client that drops a decision request cancels it: the body is read first,
 then the work runs under vLLM's ``with_cancellation`` (which listens for the
-disconnect), and the layer cancels the decision's engine reads.
+disconnect), and the layer cancels the decision's engine reads. As on vLLM's own
+routes, ``load_aware_call`` sits inside it, so with ``--enable-server-load-tracking``
+decisions count in the server-load metric (and the disconnect listener's
+decrement has its matching increment).
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ import asyncio
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
-from vllm.entrypoints.serve.utils.api_utils import with_cancellation
+from vllm.entrypoints.serve.utils.api_utils import load_aware_call, with_cancellation
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -38,6 +41,7 @@ def _layer(request: Request):
 
 
 @with_cancellation
+@load_aware_call
 async def _answer(
     layer, raw_request: Request, target: str, headers, body: bytes
 ) -> Response:

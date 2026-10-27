@@ -79,9 +79,20 @@ def _defaults_4b(
     d.args["attention_backend"] = "TRITON_ATTN"
     d.args["max_num_batched_tokens"] = 40960
     d.env["VLLM_GDN_PREFILL_GRAPH_PRECAPTURE"] = "1"
+    # serve.sh CUDA_GRAPH_MAX_TOKENS: 512 when two-way is the default reading, 2048
+    # with TWO_WAY=0; explicit, so a GPU whose vLLM default differs (1024 on compute
+    # capability 10.x) still runs the card's step graphs
+    d.args["max_cudagraph_capture_size"] = 512
     if not two_way:
-        d.args["max_num_batched_tokens"] = 8192
-        d.notes.append("one-way: chunked prefill at 8192 (the card's one-way setting)")
+        # serve.sh ONE_ENGINE=1 TWO_WAY=0: the same one engine (TRITON, a step
+        # budget of the whole context), answering one-way by default; only the
+        # step graphs grow to 2048
+        d.args["max_cudagraph_capture_size"] = 2048
+        d.notes.append("one-way: serve.sh ONE_ENGINE=1 TWO_WAY=0 (one-way by default)")
+    # serve.sh: --allowed-media-domains media.invalid (vLLM never fetches a URL; the
+    # shim fetches image links with its own checks). Here vLLM's own routes share the
+    # public port, so this also keeps /v1/chat/completions from fetching URLs.
+    d.args["allowed_media_domains"] = ["media.invalid"]
     image = cfg.get("image")
     if isinstance(image, dict):
         d.args["limit_mm_per_prompt"] = {
@@ -122,6 +133,10 @@ def _defaults_31b(
     #   --max-num-batched-tokens window+seqs (two-way)]
     d.args["max_logprobs"] = 20
     d.args["dtype"] = "bfloat16"
+    # not in the 31B serve.sh (its vLLM port is the shim's private backend); here
+    # vLLM's routes are on the public port, so its chat route must not fetch URLs
+    # for a caller (the shim fetches image links with its own checks)
+    d.args["allowed_media_domains"] = ["media.invalid"]
     d.args["quantization"] = "fp8"
     image = cfg.get("image")
     if isinstance(image, dict):
@@ -204,6 +219,8 @@ _VLLM_DEFAULTS: dict[str, Any] = {
     "dtype": "auto",
     "quantization": None,
     "h2o_decisions_two_way_window": None,
+    "max_cudagraph_capture_size": None,
+    "allowed_media_domains": None,
 }
 
 

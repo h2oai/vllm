@@ -143,6 +143,10 @@ class EngineDispatcher:
             decision.register(future)
         try:
             return future.result(self.timeout)
+        except concurrent.futures.TimeoutError:
+            # the shim gives up on this read (its 502); stop the engine's work too
+            future.cancel()
+            raise
         except concurrent.futures.CancelledError as e:
             raise DecisionCancelled(
                 "the decision was cancelled: its client dropped the request"
