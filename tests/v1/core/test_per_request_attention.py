@@ -359,11 +359,16 @@ def test_the_frontend_checks_bidirectional_requests_only(monkeypatch):
         return SimpleNamespace(
             vllm_config=config,
             model_config=SimpleNamespace(
-                return_sampling_mask=False, enable_trace_replay=False
+                return_sampling_mask=False,
+                enable_trace_replay=False,
+                is_diffusion=False,
             ),
             speculative_config=None,
             structured_outputs_config=None,
             tokenizer=None,
+            diffusion_config=None,
+            validate_logits_processors_params=lambda params: None,
+            resolve_watermarking=lambda params: None,
         )
 
     validate = InputProcessor._validate_params

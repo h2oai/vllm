@@ -1175,7 +1175,9 @@ class Scheduler(SchedulerInterface):
                             continue
                         if num_new_tokens > request_token_budget:
                             request_queue.pop_request()
-                            if self._defer_bidirectional(request, step_skipped_waiting):
+                            if self._defer_bidirectional(
+                                request, step_skipped_waiting, step_skipped_kv_holding
+                            ):
                                 break
                             continue
 
@@ -1308,7 +1310,9 @@ class Scheduler(SchedulerInterface):
                             continue
                         if request.has_encoder_inputs and not self.is_encoder_decoder:
                             self.encoder_cache_manager.free(request)
-                        step_skipped_waiting.prepend_request(request)
+                        self._requeue_skipped_bidirectional(
+                            request, step_skipped_waiting, step_skipped_kv_holding
+                        )
                         continue
 
                     if num_new_tokens == 0:
@@ -2568,8 +2572,26 @@ class Scheduler(SchedulerInterface):
         else:
             self.waiting.add_request(request)
 
+    def _requeue_skipped_bidirectional(
+        self,
+        request: Request,
+        step_skipped_waiting: deque[Request],
+        step_skipped_kv_holding: deque[Request],
+    ) -> None:
+        """Put an already-popped bidirectional request back for a later step
+        the way skip_request does: counted as deferred, ahead of older skipped
+        requests, on the kv-holding queue when it holds KV blocks."""
+        self.deferred_waiting.add(request)
+        if self._holds_kv_blocks(request):
+            step_skipped_kv_holding.appendleft(request)
+        else:
+            step_skipped_waiting.appendleft(request)
+
     def _defer_bidirectional(
-        self, request: Request, step_skipped_waiting: RequestQueue
+        self,
+        request: Request,
+        step_skipped_waiting: deque[Request],
+        step_skipped_kv_holding: deque[Request],
     ) -> bool:
         """Put a bidirectional request that does not fit this step's token
         budget back for a later one. Returns True when nothing further should
@@ -2583,7 +2605,9 @@ class Scheduler(SchedulerInterface):
         holds admission: an encoder-split deferral never does, since the
         requests behind it may hold the encoder-cache references whose release
         it is waiting for."""
-        step_skipped_waiting.prepend_request(request)
+        self._requeue_skipped_bidirectional(
+            request, step_skipped_waiting, step_skipped_kv_holding
+        )
         request.bidirectional_deferrals += 1
         return request.bidirectional_deferrals > BIDIRECTIONAL_MAX_DEFERRALS
 
