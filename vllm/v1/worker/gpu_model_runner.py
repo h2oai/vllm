@@ -2591,12 +2591,16 @@ class GPUModelRunner(
             causal_attn_metadata_i = None
             if causal_common_attn_metadata is not None:
                 # the windowed layers of a mixed group: their own build, causal
+                # (0.32: cascade attention is gone; the build goes through the
+                # attention group as the plain build above does)
                 causal_attn_metadata_i = (
-                    builder.build_for_cudagraph_capture(causal_common_attn_metadata)
+                    attn_group.build_metadata_for_cudagraph_capture(
+                        causal_common_attn_metadata, ubid or 0
+                    )
                     if for_cudagraph_capture
-                    else builder.build(
-                        common_prefix_len=cascade_attn_prefix_len,
-                        common_attn_metadata=causal_common_attn_metadata,
+                    else attn_group.build_metadata(
+                        causal_common_attn_metadata,
+                        ubid or 0,
                         **extra_attn_metadata_args,
                     )
                 )
