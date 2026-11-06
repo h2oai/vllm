@@ -166,6 +166,13 @@ class AsyncOutput(AsyncModelRunnerOutput):
 
     def get_output(self) -> ModelRunnerOutput:
         self.copy_event.synchronize()
+        # H2O residual router: the flagged requests' pending host copies (issued on the same copy stream before
+        # copy_event) become bytes here, on the worker, before the output leaves the process
+        rf = getattr(self.model_runner_output, "residual_features_dict", None)
+        if rf:
+            self.model_runner_output.residual_features_dict = {
+                k: (v.resolve() if hasattr(v, "resolve") else v) for k, v in rf.items()
+            }
 
         # NOTE(woosuk): The following code is to ensure compatibility with
         # the existing model runner.

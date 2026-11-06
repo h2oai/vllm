@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from contextlib import AbstractContextManager
 from copy import deepcopy
@@ -197,6 +198,22 @@ def _attention_mode_of(sampling_params) -> str:
         return "bidirectional"
     return "causal"
 
+class _H2OPendingFeatures:
+    """H2O residual router: a flagged request's last-prompt-token vector in flight to pinned host memory on the async
+    output copy stream; resolve() (called by the scheduler, after the step's output event has completed) waits on the
+    copy's event and returns the float16 bytes. Holds the device tensor until then so it cannot be reused early."""
+
+    __slots__ = ("buf", "event", "vec")
+
+    def __init__(self, buf, event, vec):
+        self.buf, self.event, self.vec = buf, event, vec
+
+    def resolve(self) -> bytes:
+        self.event.synchronize()
+        self.vec = None
+        return self.buf.numpy().tobytes()
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -286,6 +303,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Speculative decoding.
         self.speculator = None
         self.use_aux_hidden_state_outputs = False
+        # H2O residual router (same contract as the V1 runner): VLLM_H2O_RESIDUAL_LAYERS, sorted ascending; the
+        # requests that asked for the features (vllm_xargs residual_features), and the vectors ready for this step
+        self.h2o_residual_layers: tuple[int, ...] = tuple(sorted({
+            int(x) for x in os.environ.get("VLLM_H2O_RESIDUAL_LAYERS", "").split(",") if x.strip()
+        }))
+        self.h2o_feature_reqs: set[str] = set()
+        self._h2o_resid_ready: dict[str, bytes] = {}
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
@@ -433,6 +457,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
                     assert self.pp_handler is not None
                     self.pp_handler.configure_aux_hidden_state_relay(self.model)
+            self._h2o_enable_residual_layers()
             if isinstance(self.speculator, DraftModelSpeculator):
                 with use_workspace_lane(self._draft_workspace_lane):
                     self.speculator.load_model(self.model)
@@ -1095,8 +1120,68 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return cuda_graph_size
 
+
+    # ------------------------------------------------------------------ H2O residual router (V2 runner)
+    def _h2o_enable_residual_layers(self) -> None:
+        """After load_model: ask the model for the residual stream entering the chosen layers (aux hidden states)."""
+        if not self.h2o_residual_layers:
+            return
+        setter = getattr(self.model, "set_aux_hidden_state_layers", None)
+        if setter is None:
+            logger.warning("H2O residual router: model %s has no aux hidden state support; features off",
+                           type(self.model).__name__)
+            self.h2o_residual_layers = ()
+            return
+        setter(self.h2o_residual_layers)
+        self.use_aux_hidden_state_outputs = True
+        logger.info("H2O residual router: returning the last-prompt-token residual vector of layers %s on request",
+                    self.h2o_residual_layers)
+
+    @staticmethod
+    def _h2o_wants_features(sampling_params) -> bool:
+        extra = getattr(sampling_params, "extra_args", None) or {}
+        return bool(extra.get("residual_features"))
+
+    def _h2o_pool_residual(self, input_batch, aux_hidden_states) -> None:
+        """For each flagged request whose prompt completes in this step, take the chosen layers' residual vector at
+        the LAST PROMPT TOKEN (always computed in the final prefill chunk, cached prefix or not: invariant to
+        prefix-cache hits and chunking) and mark it ready; popped by this step's runner output. No state survives
+        the step."""
+        qsl = input_batch.query_start_loc_np
+        n_sched = input_batch.num_scheduled_tokens
+        n_done = input_batch.num_computed_tokens_np
+        prompt_len = self.req_states.prompt_len.np
+        idx = input_batch.idx_mapping_np
+        for i, rid in enumerate(input_batch.req_ids[: input_batch.num_reqs]):
+            if rid not in self.h2o_feature_reqs:
+                continue
+            d, s, p = int(n_done[i]), int(n_sched[i]), int(prompt_len[idx[i]])
+            if p <= 0 or d >= p or d + s < p:
+                continue    # the last prompt token is not in this chunk (or the prompt was already complete)
+            row = int(qsl[i]) + (p - 1 - d)
+            vec = torch.stack([h[row] for h in aux_hidden_states], 0).to(torch.float16)      # [L, d], on the device
+            # v2.5: no device sync here. The copy to pinned host memory runs on the existing async output copy stream
+            # (ordered after the forward on the main stream); the bytes are read by the scheduler through resolve(),
+            # after that step's output event has been synchronized by the AsyncOutput path.
+            buf = torch.empty(vec.shape, dtype=torch.float16, device="cpu", pin_memory=True)
+            with torch.cuda.stream(self.output_copy_stream):
+                self.output_copy_stream.wait_stream(self.main_stream)
+                buf.copy_(vec, non_blocking=True)
+                ev = torch.cuda.Event()
+                ev.record(self.output_copy_stream)
+            self._h2o_resid_ready[rid] = _H2OPendingFeatures(buf, ev, vec)
+
+    def _h2o_pop_ready(self) -> dict:
+        """Pending host copies; AsyncOutput.get_output() resolves them to bytes on the worker side (every executor)."""
+        if not self._h2o_resid_ready:
+            return {}
+        ready, self._h2o_resid_ready = self._h2o_resid_ready, {}
+        return ready
+
     def _remove_request(self, req_id: str) -> bool:
         self.req_attention_mode.pop(req_id, None)
+        self.h2o_feature_reqs.discard(req_id)        # H2O residual router: finished / aborted / re-added request
+        self._h2o_resid_ready.pop(req_id, None)
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
         self.model_state.remove_request(req_id)
@@ -1159,6 +1244,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if mode != "causal":
                 self.req_attention_mode[req_id] = mode
                 logger.debug("H2O per-request attention: request %s is %s", req_id, mode)
+            if self.h2o_residual_layers and self._h2o_wants_features(new_req_data.sampling_params):
+                self.h2o_feature_reqs.add(req_id)    # H2O residual router: this request gets its last-token vector
 
             prompt_len = new_req_data.prompt_len
             sampling_params = new_req_data.sampling_params
@@ -2111,6 +2198,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch,
             )
 
+        # H2O residual router: the last-prompt-token vectors of the flagged requests whose prompt completed this step
+        if self.h2o_residual_layers and self.h2o_feature_reqs and aux_hidden_states is not None:
+            self._h2o_pool_residual(input_batch, aux_hidden_states)
+
         assert self.prompt_logprobs_worker is not None
         prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
             self.model.compute_logits,
@@ -2130,6 +2221,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
             cudagraph_stats=cudagraph_stats,
+            residual_features_dict=self._h2o_pop_ready(),   # H2O residual router
         )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(

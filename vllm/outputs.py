@@ -146,6 +146,7 @@ class RequestOutput:
         num_cache_creation_tokens: int | None = None,
         *,
         kv_transfer_params: dict[str, Any] | None = None,
+        residual_features: bytes | None = None,
         ec_transfer_params: dict[str, Any] | None = None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
@@ -168,6 +169,7 @@ class RequestOutput:
         self.num_cached_tokens = num_cached_tokens
         self.num_cache_creation_tokens = num_cache_creation_tokens
         self.kv_transfer_params = kv_transfer_params
+        self.residual_features = residual_features
         self.ec_transfer_params = ec_transfer_params
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:

@@ -388,6 +388,7 @@ class RequestState:
             prompt_logprobs=prompt_logprobs,
             outputs=cast(list[CompletionOutput], outputs),
             finished=finished,
+            residual_features=getattr(self, "residual_features", None),
             kv_transfer_params=kv_transfer_params,
             ec_transfer_params=ec_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
@@ -710,6 +711,8 @@ class OutputProcessor:
                 # 3) Compute sample and prompt logprobs for request,
                 # if required.
                 req_state.logprobs_processor.update_from_output(engine_core_output)
+                if getattr(engine_core_output, "new_residual_features", None) is not None:
+                    req_state.residual_features = engine_core_output.new_residual_features
 
             # 4) Create and handle RequestOutput objects.
             if request_output := req_state.make_request_output(

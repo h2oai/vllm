@@ -75,6 +75,11 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
+
+def _h2o_resolve(v):
+    """H2O residual router: the runner may hand a pending host copy (resolve() -> bytes) instead of bytes."""
+    return v.resolve() if (v is not None and hasattr(v, "resolve")) else v
+
 # H2O per-request attention: a bidirectional prompt that fits one step but not this
 # step's remaining budget is deferred; after this many deferrals the waiting queues
 # admit nothing behind it until it is scheduled (bounded aging, _defer_bidirectional).
@@ -1988,6 +1993,7 @@ class Scheduler(SchedulerInterface):
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
+        residual_features_dict = getattr(model_runner_output, "residual_features_dict", None) or {}
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
@@ -2267,6 +2273,7 @@ class Scheduler(SchedulerInterface):
                         new_logprobs=new_logprobs,
                         new_sampling_mask=new_sampling_mask,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
+                        new_residual_features=_h2o_resolve(residual_features_dict.get(req_id)),
                         pooling_output=pooler_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
