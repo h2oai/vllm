@@ -70,6 +70,26 @@ from vllm.utils.serial_utils import numpy2base64
 logger = init_logger(__name__)
 
 
+def _h2o_residual_features_field(raw: bytes | None) -> dict | None:
+    """H2O residual router: the last-prompt-token residual vectors as a JSON-safe field (base64 float16 [L, d])."""
+    if not raw:
+        return None
+    import base64
+    import os as _os
+
+    # sorted ascending, exactly as the model runner orders the vectors (its env parse is sorted too)
+    layers = sorted({int(x) for x in _os.environ.get("VLLM_H2O_RESIDUAL_LAYERS", "").split(",") if x.strip()})
+    n = len(raw) // 2
+    dim = n // max(1, len(layers))
+    return {
+        "layers": layers,
+        "pooling": ["last"],
+        "dtype": "float16",
+        "dim": dim,
+        "data": base64.b64encode(raw).decode("ascii"),
+    }
+
+
 def _get_mm_token_counts(engine_input: EngineInput) -> dict[str, int]:
     """Sum per-modality placeholder tokens from ``mm_placeholders``.
 
@@ -1168,6 +1188,9 @@ class OpenAIServingChat(GenerateBaseServing):
             usage=usage,
             system_fingerprint=self.system_fingerprint,
             prompt_logprobs=clamp_prompt_logprobs(final_res.prompt_logprobs),
+            residual_features=_h2o_residual_features_field(
+                getattr(final_res, "residual_features", None)
+            ),
             prompt_token_ids=(
                 final_res.prompt_token_ids if request.return_token_ids else None
             ),

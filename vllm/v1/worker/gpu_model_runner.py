@@ -3,6 +3,7 @@
 
 import functools
 import gc
+import os
 import itertools
 import threading
 import time
@@ -635,6 +636,15 @@ class GPUModelRunner(
         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
 
         self.use_aux_hidden_state_outputs = False
+        # H2O residual router: VLLM_H2O_RESIDUAL_LAYERS (e.g. "20,30,40,50") makes the model return the residual stream
+        # entering those layers (the output of blocks 19 / 29 / 39 / 49, the tensors the offline extractor read) through
+        # the aux-hidden-state path; requests whose vllm_xargs carry `residual_features` get, once their prompt is
+        # complete, the vector at the last prompt token back. Sorted ascending: the aux hidden states arrive in forward
+        # order and the response field lists the layers in this order.
+        self.h2o_residual_layers: tuple[int, ...] = tuple(sorted({
+            int(x) for x in os.environ.get("VLLM_H2O_RESIDUAL_LAYERS", "").split(",") if x.strip()
+        }))
+        self._h2o_resid_ready: dict[str, bytes] = {}
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
@@ -4297,6 +4307,57 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
+
+    # ------------------------------------------------------------------ H2O residual router
+    def _h2o_enable_residual_layers(self) -> None:
+        """After load_model: ask the model for the residual stream entering the chosen layers (aux hidden states)."""
+        if not self.h2o_residual_layers:
+            return
+        setter = getattr(self.model, "set_aux_hidden_state_layers", None)
+        if setter is None:
+            logger.warning("H2O residual router: model %s has no aux hidden state support; features off",
+                           type(self.model).__name__)
+            self.h2o_residual_layers = ()
+            return
+        setter(self.h2o_residual_layers)
+        self.use_aux_hidden_state_outputs = True
+        logger.info("H2O residual router: returning the last-prompt-token residual vector of layers %s on request",
+                    self.h2o_residual_layers)
+
+    @staticmethod
+    def _h2o_wants_features(req_state) -> bool:
+        sp = getattr(req_state, "sampling_params", None)
+        extra = getattr(sp, "extra_args", None) or {}
+        return bool(extra.get("residual_features"))
+
+    def _h2o_pool_residual(self, scheduler_output, aux_hidden_states) -> None:
+        """For each flagged request whose prompt completes in this step, take the chosen layers' residual vector at
+        the LAST PROMPT TOKEN (it is always computed in the final prefill chunk, cached prefix or not, so the vector
+        is invariant to prefix-cache hits and chunking) and mark the request ready. No state survives the step: the
+        ready dict is popped by the runner output of the same step; a preempted request that restarts recomputes."""
+        num_reqs = self.input_batch.num_reqs
+        qsl = self.query_start_loc.np
+        for i, rid in enumerate(self.input_batch.req_ids[:num_reqs]):
+            rs = self.requests.get(rid)
+            if rs is None or not self._h2o_wants_features(rs):
+                continue
+            n_sched = scheduler_output.num_scheduled_tokens.get(rid, 0)
+            if n_sched <= 0:
+                continue
+            n_prompt = int(getattr(rs, "num_prompt_tokens", 0) or 0)
+            n_done = int(rs.num_computed_tokens)
+            if n_prompt <= 0 or n_done >= n_prompt or n_done + n_sched < n_prompt:
+                continue    # the last prompt token is not in this chunk (or the prompt was already complete)
+            row = int(qsl[i]) + (n_prompt - 1 - n_done)
+            vec = torch.stack([h[row] for h in aux_hidden_states], 0)      # [L, d]
+            self._h2o_resid_ready[rid] = vec.to(torch.float16).cpu().numpy().tobytes()
+
+    def _h2o_pop_ready(self) -> dict[str, bytes]:
+        if not self._h2o_resid_ready:
+            return {}
+        ready, self._h2o_resid_ready = self._h2o_resid_ready, {}
+        return ready
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -4584,8 +4645,10 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
-                # True when EAGLE 3 is used.
+                # True when EAGLE 3 is used, or the H2O residual router is on.
                 hidden_states, aux_hidden_states = model_output
+                if self.h2o_residual_layers and aux_hidden_states is not None:
+                    self._h2o_pool_residual(scheduler_output, aux_hidden_states)
             else:
                 # Common case.
                 hidden_states = model_output
@@ -4898,6 +4961,7 @@ class GPUModelRunner(
                 sampled_token_ids=valid_sampled_token_ids,
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
+                residual_features_dict=self._h2o_pop_ready(),
                 kv_connector_output=kv_connector_output,
                 ec_connector_output=ec_connector_output
                 if self.supports_mm_inputs
@@ -5424,6 +5488,10 @@ class GPUModelRunner(
 
     @instrument(span_name="Loading (GPU)")
     def load_model(self, load_dummy_weights: bool = False) -> None:
+        self._h2o_load_model(load_dummy_weights=load_dummy_weights)
+        self._h2o_enable_residual_layers()
+
+    def _h2o_load_model(self, load_dummy_weights: bool = False) -> None:
         """
         Args:
             load_dummy_weights: load dummy weights instead of real weights.

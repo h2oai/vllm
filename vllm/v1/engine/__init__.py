@@ -204,6 +204,8 @@ class EngineCoreOutput(
 
     new_logprobs: LogprobsLists | None = None
     new_prompt_logprobs_tensors: LogprobsTensors | None = None
+    # H2O residual router: pooled residual-stream vectors (float16 bytes), once per request
+    new_residual_features: bytes | None = None
 
     pooling_output: torch.Tensor | None = None
 

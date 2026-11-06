@@ -345,6 +345,9 @@ class ModelRunnerOutput:
     prompt_logprobs_dict: dict[str, LogprobsTensors | None] = field(
         default_factory=dict
     )
+    # H2O residual router: req_id -> float16 bytes of the residual stream at the last prompt token, [L, d], for requests
+    # that asked for it; set once, in the step their prompt completes
+    residual_features_dict: dict[str, bytes] = field(default_factory=dict)
 
     # [num_reqs, hidden_size]
     pooler_output: list[torch.Tensor | None] | None = None

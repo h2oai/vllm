@@ -137,6 +137,8 @@ class ChatCompletionResponse(OpenAIBaseModel):
     # vLLM-specific fields that are not in OpenAI spec
     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
     prompt_token_ids: list[int] | None = None
+    # H2O residual router: {"layers": [...], "pooling": ["last", "mean"], "dtype": "float16", "dim": d, "data": base64}
+    residual_features: dict[str, Any] | None = None
     # Rendered prompt text from chat templating (only set when
     # ``return_prompt_text=True`` on the request).
     prompt_text: str | None = None
