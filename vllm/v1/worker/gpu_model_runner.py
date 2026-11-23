@@ -645,6 +645,10 @@ class GPUModelRunner(
             int(x) for x in os.environ.get("VLLM_H2O_RESIDUAL_LAYERS", "").split(",") if x.strip()
         }))
         self._h2o_resid_ready: dict[str, bytes] = {}
+        # gather-first capture (vllm/v1/worker/h2o_residual.py): the model keeps only the rows named here (one per
+        # request whose prompt completes in the step) instead of every token of the step; None = old full-step path
+        self._h2o_rows = None
+        self._h2o_staged: list[str] = []
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
@@ -4319,10 +4323,22 @@ class GPUModelRunner(
                            type(self.model).__name__)
             self.h2o_residual_layers = ()
             return
+        spec_uses_aux = self.use_aux_hidden_state_outputs   # a drafter reading every token's aux states
         setter(self.h2o_residual_layers)
         self.use_aux_hidden_state_outputs = True
         logger.info("H2O residual router: returning the last-prompt-token residual vector of layers %s on request",
                     self.h2o_residual_layers)
+        # Gather-first: only on a single-stage, non-microbatched, non-PCP runner whose aux states no drafter reads
+        # (there the aux states must stay per token); otherwise the old full-step capture.
+        pc = self.parallel_config
+        if (not spec_uses_aux and pc.pipeline_parallel_size <= 1 and pc.prefill_context_parallel_size <= 1
+                and not pc.use_ubatching):
+            from vllm.v1.worker.h2o_residual import enable_row_gather
+            rows = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
+            if enable_row_gather(self.model, rows.gpu):
+                self._h2o_rows = rows
+        logger.info("H2O residual router: gather-first capture %s (%d rows)",
+                    "on" if self._h2o_rows is not None else "off", self.max_num_reqs)
 
     @staticmethod
     def _h2o_wants_features(req_state) -> bool:
@@ -4330,11 +4346,9 @@ class GPUModelRunner(
         extra = getattr(sp, "extra_args", None) or {}
         return bool(extra.get("residual_features"))
 
-    def _h2o_pool_residual(self, scheduler_output, aux_hidden_states) -> None:
-        """For each flagged request whose prompt completes in this step, take the chosen layers' residual vector at
-        the LAST PROMPT TOKEN (it is always computed in the final prefill chunk, cached prefix or not, so the vector
-        is invariant to prefix-cache hits and chunking) and mark the request ready. No state survives the step: the
-        ready dict is popped by the runner output of the same step; a preempted request that restarts recomputes."""
+    def _h2o_todo(self, scheduler_output) -> list[tuple[str, int]]:
+        """(req_id, row in the step) of each flagged request whose LAST PROMPT TOKEN is in this step, batch order."""
+        todo = []
         num_reqs = self.input_batch.num_reqs
         qsl = self.query_start_loc.np
         for i, rid in enumerate(self.input_batch.req_ids[:num_reqs]):
@@ -4348,9 +4362,42 @@ class GPUModelRunner(
             n_done = int(rs.num_computed_tokens)
             if n_prompt <= 0 or n_done >= n_prompt or n_done + n_sched < n_prompt:
                 continue    # the last prompt token is not in this chunk (or the prompt was already complete)
-            row = int(qsl[i]) + (n_prompt - 1 - n_done)
-            vec = torch.stack([h[row] for h in aux_hidden_states], 0)      # [L, d]
-            self._h2o_resid_ready[rid] = vec.to(torch.float16).cpu().numpy().tobytes()
+            todo.append((rid, int(qsl[i]) + (n_prompt - 1 - n_done)))
+        return todo
+
+    def _h2o_stage_rows(self, scheduler_output) -> None:
+        """After _prepare_inputs, inside synchronize_input_prep (the pinned buffer is not reused before the previous
+        step's copy ran): write this step's last-prompt-token rows into slots 0..n-1 of the model's row buffer."""
+        self._h2o_staged = []
+        if self._h2o_rows is None:
+            return
+        todo = self._h2o_todo(scheduler_output)
+        if not todo:
+            return
+        n = len(todo)
+        self._h2o_rows.np[:n] = [row for _, row in todo]
+        self._h2o_rows.copy_to_gpu(n)
+        self._h2o_staged = [rid for rid, _ in todo]
+
+    def _h2o_pool_residual(self, scheduler_output, aux_hidden_states) -> None:
+        """For each flagged request whose prompt completes in this step, take the chosen layers' residual vector at
+        the LAST PROMPT TOKEN (it is always computed in the final prefill chunk, cached prefix or not, so the vector
+        is invariant to prefix-cache hits and chunking) and mark the request ready. No state survives the step: the
+        ready dict is popped by the runner output of the same step; a preempted request that restarts recomputes."""
+        from vllm.v1.worker.h2o_residual import gather_vectors
+        todo = self._h2o_todo(scheduler_output)
+        staged, self._h2o_staged = self._h2o_staged, []
+        if not todo:
+            return
+        # gathered: the model kept only the staged rows (request k in slot k); a graph that did not gather returns
+        # every token's state (more rows than the buffer) and is read by row as before
+        gathered = (self._h2o_rows is not None and len(aux_hidden_states) > 0
+                    and aux_hidden_states[0].shape[0] <= self._h2o_rows.gpu.shape[0])
+        if gathered and staged != [rid for rid, _ in todo]:
+            logger.warning("H2O residual router: staged rows do not match this step's requests; vectors skipped")
+            return
+        for rid, vec in gather_vectors(aux_hidden_states, todo, gathered):      # [L, d] float16
+            self._h2o_resid_ready[rid] = vec.cpu().numpy().tobytes()
 
     def _h2o_pop_ready(self) -> dict[str, bytes]:
         if not self._h2o_resid_ready:
@@ -4443,6 +4490,8 @@ class GPUModelRunner(
             logits_indices, spec_decode_metadata, max_num_sampled_tokens = (
                 self._prepare_inputs(scheduler_output, num_scheduled_tokens_np)
             )
+            if self.h2o_residual_layers:
+                self._h2o_stage_rows(scheduler_output)   # H2O residual router: gather-first rows of this step
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)

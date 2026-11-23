@@ -323,6 +323,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # one pinned host pool for the flagged requests' vectors (max_num_seqs slots, allocated at first use)
         self._h2o_pin_pool: torch.Tensor | None = None
         self._h2o_pin_free: list[int] = []
+        # gather-first capture (vllm/v1/worker/h2o_residual.py): the model keeps only the rows named here (one per
+        # request whose prompt completes in the step) instead of every token of the step; None = old full-step path
+        self._h2o_rows_gpu: torch.Tensor | None = None
+        self._h2o_rows_pool = None
+        self._h2o_staged: list[str] = []
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
@@ -1145,10 +1150,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                            type(self.model).__name__)
             self.h2o_residual_layers = ()
             return
+        spec_uses_aux = self.use_aux_hidden_state_outputs   # a drafter reading every token's aux states
         setter(self.h2o_residual_layers)
         self.use_aux_hidden_state_outputs = True
         logger.info("H2O residual router: returning the last-prompt-token residual vector of layers %s on request",
                     self.h2o_residual_layers)
+        # Gather-first: only on a single-stage, non-microbatched, non-PCP runner whose aux states no drafter reads
+        # (there the aux states must stay per token); otherwise the old full-step capture.
+        pc = self.parallel_config
+        if (not spec_uses_aux and not self.use_pp and pc.prefill_context_parallel_size <= 1
+                and not pc.use_ubatching):
+            from vllm.v1.worker.gpu.buffer_utils import UvaBufferPool
+            from vllm.v1.worker.h2o_residual import enable_row_gather
+            with torch.inference_mode(False):       # mutable runtime state, like the runner's other buffers
+                rows = torch.zeros(self.max_num_reqs, dtype=torch.int64, device=self.device)
+            if enable_row_gather(self.model, rows):
+                self._h2o_rows_gpu = rows
+                self._h2o_rows_pool = UvaBufferPool(self.max_num_reqs, torch.int64)
+        logger.info("H2O residual router: gather-first capture %s (%d rows)",
+                    "on" if self._h2o_rows_gpu is not None else "off", self.max_num_reqs)
 
     @staticmethod
     def _h2o_wants_features(sampling_params) -> bool:
@@ -1159,11 +1179,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         extra = getattr(sampling_params, "extra_args", None) or {}
         return bool(extra.get("residual_features"))
 
-    def _h2o_pool_residual(self, input_batch, aux_hidden_states) -> None:
-        """For each flagged request whose prompt completes in this step, take the chosen layers' residual vector at
-        the LAST PROMPT TOKEN (always computed in the final prefill chunk, cached prefix or not: invariant to
-        prefix-cache hits and chunking) and mark it ready; popped by this step's runner output. No state survives
-        the step."""
+    def _h2o_todo(self, input_batch) -> list[tuple[str, int]]:
+        """(req_id, row in the step) of each flagged request whose LAST PROMPT TOKEN is in this step, batch order."""
         qsl = input_batch.query_start_loc_np
         n_sched = input_batch.num_scheduled_tokens
         n_done = input_batch.num_computed_tokens_np
@@ -1177,10 +1194,41 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if p <= 0 or d >= p or d + s < p:
                 continue    # the last prompt token is not in this chunk (or the prompt was already complete)
             todo.append((rid, int(qsl[i]) + (p - 1 - d)))
+        return todo
+
+    def _h2o_stage_rows(self, input_batch) -> None:
+        """Before the forward (main stream): write this step's last-prompt-token rows into slots 0..n-1 of the
+        model's row buffer (gather-first capture). Steps that complete no flagged prompt write nothing."""
+        self._h2o_staged = []
+        if self._h2o_rows_gpu is None or not self.h2o_feature_reqs:
+            return
+        todo = self._h2o_todo(input_batch)
+        if not todo:
+            return
+        n = len(todo)
+        self._h2o_rows_pool.copy_to_gpu(np.array([row for _, row in todo], dtype=np.int64),
+                                        out=self._h2o_rows_gpu[:n])
+        self._h2o_staged = [rid for rid, _ in todo]
+
+    def _h2o_pool_residual(self, input_batch, aux_hidden_states) -> None:
+        """For each flagged request whose prompt completes in this step, take the chosen layers' residual vector at
+        the LAST PROMPT TOKEN (always computed in the final prefill chunk, cached prefix or not: invariant to
+        prefix-cache hits and chunking) and mark it ready; popped by this step's runner output. No state survives
+        the step."""
+        from vllm.v1.worker.h2o_residual import gather_vectors
+        todo = self._h2o_todo(input_batch)
+        staged, self._h2o_staged = self._h2o_staged, []
         if not todo:
             return          # no flagged prompt completes in this step -> no gather, no stream work, no event
+        # gathered: the model kept only the staged rows (request k in slot k); a graph that did not gather returns
+        # every token's state (more rows than the buffer) and is read by row as before
+        gathered = (self._h2o_rows_gpu is not None and len(aux_hidden_states) > 0
+                    and aux_hidden_states[0].shape[0] <= self._h2o_rows_gpu.shape[0])
+        if gathered and staged != [rid for rid, _ in todo]:
+            logger.warning("H2O residual router: staged rows do not match this step's requests; vectors skipped")
+            return
         # the gather (a few tiny kernels per request) on the main stream, where the aux states were produced
-        vecs = [(rid, torch.stack([h[row] for h in aux_hidden_states], 0).to(torch.float16)) for rid, row in todo]
+        vecs = gather_vectors(aux_hidden_states, todo, gathered)
         if self._h2o_pin_pool is None:
             n_layers, dim = vecs[0][1].shape
             self._h2o_pin_pool = torch.empty((self.max_num_reqs, n_layers, dim), dtype=torch.float16, device="cpu",
@@ -1889,6 +1937,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch = self.prepare_inputs(
                 scheduler_output, batch_req_state, batch_desc
             )
+            if self.h2o_residual_layers:
+                self._h2o_stage_rows(input_batch)   # H2O residual router: gather-first rows of this step
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and

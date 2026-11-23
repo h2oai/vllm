@@ -637,7 +637,9 @@ class ModelCudaGraphManager(CudaGraphManager):
                         torch.empty_like(x) for x in aux_hidden_states
                     ]
                 for i, aux in enumerate(aux_hidden_states):
-                    self.aux_hidden_states[i][:num_tokens] = aux
+                    # per-token aux states have num_tokens rows; the H2O residual router's gathered ones have a fixed
+                    # max_num_seqs rows (vllm/v1/worker/h2o_residual.py)
+                    self.aux_hidden_states[i][: aux.shape[0]] = aux
             else:
                 # Non-last PP rank.
                 assert isinstance(model_output, IntermediateTensors)

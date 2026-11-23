@@ -1606,6 +1606,15 @@ class EagleModelMixin:
         residual: torch.Tensor | None,
     ) -> list[torch.Tensor]:
         if layer_idx in self.aux_hidden_state_layers:
+            # H2O residual router (vllm/v1/worker/h2o_residual.py): with the row buffer registered, keep only the
+            # rows it names (each request's last prompt token), gathered BEFORE the add: [max_num_seqs, d] per layer
+            # instead of [num_tokens, d]. Indices are clamped to this step's token count (stale / dummy-run slots).
+            rows = getattr(self, "h2o_aux_rows", None)
+            if rows is not None:
+                rows = rows.clamp(max=hidden_states.shape[0] - 1)
+                hidden_states = hidden_states[rows]
+                if residual is not None:
+                    residual = residual[rows]
             value = hidden_states + residual if residual is not None else hidden_states
             aux_hidden_states.append(value)
         return aux_hidden_states
