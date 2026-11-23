@@ -649,8 +649,6 @@ class GPUModelRunner(
         # request whose prompt completes in the step) instead of every token of the step; None = old full-step path
         self._h2o_rows = None
         self._h2o_staged: list[str] = []
-        # True when the aux states exist only for the H2O capture: drafters then read hidden_states (as without it)
-        self._h2o_aux_only = False
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
@@ -4317,6 +4315,8 @@ class GPUModelRunner(
     # ------------------------------------------------------------------ H2O residual router
     def _h2o_enable_residual_layers(self) -> None:
         """After load_model: ask the model for the residual stream entering the chosen layers (aux hidden states)."""
+        from vllm.v1.worker.h2o_residual import refuse_with_speculative_decoding
+        refuse_with_speculative_decoding(self.h2o_residual_layers, self.speculative_config)   # hard error, first
         if not self.h2o_residual_layers:
             return
         setter = getattr(self.model, "set_aux_hidden_state_layers", None)
@@ -4325,12 +4325,9 @@ class GPUModelRunner(
                            type(self.model).__name__)
             self.h2o_residual_layers = ()
             return
-        from vllm.v1.worker.h2o_residual import REFUSAL, enable_row_gather, gather_off_reason
-        if self.use_aux_hidden_state_outputs:       # a drafter (EAGLE-3, DFlash, ...) reads its own aux layers
-            raise ValueError(REFUSAL.format(method=getattr(self.speculative_config, "method", None)))
+        from vllm.v1.worker.h2o_residual import enable_row_gather, gather_off_reason
         setter(self.h2o_residual_layers)
         self.use_aux_hidden_state_outputs = True
-        self._h2o_aux_only = True                   # drafters that read hidden states keep getting hidden_states
         logger.info("H2O residual router: returning the last-prompt-token residual vector of layers %s on request",
                     self.h2o_residual_layers)
         # Gather-first (only each request's last-prompt-token rows are kept), unless the setup shards or splits the
@@ -4347,10 +4344,6 @@ class GPUModelRunner(
         else:
             logger.warning("H2O residual router: gather-first capture OFF (%s): every token's residual of the "
                            "selected layers is kept per step, O(tokens) memory", reason)
-
-    def _drafter_reads_aux(self) -> bool:
-        """The drafter's target hidden states are the aux states (EAGLE-3 / DFlash), not the H2O router's."""
-        return self.use_aux_hidden_state_outputs and not self._h2o_aux_only
 
     @staticmethod
     def _h2o_wants_features(req_state) -> bool:
@@ -5462,7 +5455,7 @@ class GPUModelRunner(
                 # input_ids can be None for multimodal models.
                 target_token_ids = self.input_ids.gpu[:num_scheduled_tokens]
                 target_positions = self._get_positions(num_scheduled_tokens)
-                if self._drafter_reads_aux():
+                if self.use_aux_hidden_state_outputs:
                     assert aux_hidden_states is not None
                     target_hidden_states = torch.cat(
                         [h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1
@@ -5479,7 +5472,7 @@ class GPUModelRunner(
                     )
                     target_token_ids = self.input_ids.gpu[token_indices]
                     target_positions = self._get_positions(token_indices)
-                    if self._drafter_reads_aux():
+                    if self.use_aux_hidden_state_outputs:
                         assert aux_hidden_states is not None
                         target_hidden_states = torch.cat(
                             [h[token_indices] for h in aux_hidden_states], dim=-1
@@ -5500,7 +5493,7 @@ class GPUModelRunner(
                     # When padding the batch, token_indices is just a range
                     target_token_ids = self.input_ids.gpu[:total_num_tokens]
                     target_positions = self._get_positions(total_num_tokens)
-                    if self._drafter_reads_aux():
+                    if self.use_aux_hidden_state_outputs:
                         assert aux_hidden_states is not None
                         target_hidden_states = torch.cat(
                             [h[:total_num_tokens] for h in aux_hidden_states], dim=-1

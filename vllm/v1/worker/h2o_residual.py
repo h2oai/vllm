@@ -67,10 +67,21 @@ def enable_row_gather(model: torch.nn.Module, rows: torch.Tensor) -> bool:
 
 
 REFUSAL = (
-    "H2O residual router (VLLM_H2O_RESIDUAL_LAYERS / VLLM_H2O_RESIDUAL_ALWAYS) cannot run with the "
-    "speculative method {method!r}: that drafter reads the target model's aux hidden states of its own layers, "
-    "which the router would replace. Unset VLLM_H2O_RESIDUAL_LAYERS or use another speculative method."
+    "H2O residual capture (VLLM_H2O_RESIDUAL_LAYERS={layers!r}, VLLM_H2O_RESIDUAL_ALWAYS={always!r}) cannot be "
+    "combined with speculative decoding (method {method!r}): capture + spec decode needs a separate, GPU-tested "
+    "change. Unset VLLM_H2O_RESIDUAL_LAYERS / VLLM_H2O_RESIDUAL_ALWAYS or disable speculative decoding."
 )
+
+
+def refuse_with_speculative_decoding(h2o_residual_layers, speculative_config) -> None:
+    """Hard startup error: residual capture (layers set and/or VLLM_H2O_RESIDUAL_ALWAYS=1) with ANY speculative
+    decoding (MTP, EAGLE-1/3, DFlash, draft model, ngram, ...). Called before anything is set on the model."""
+    import os
+    always = os.environ.get("VLLM_H2O_RESIDUAL_ALWAYS", "")
+    if speculative_config is None or not (h2o_residual_layers or always == "1"):
+        return
+    raise ValueError(REFUSAL.format(layers=os.environ.get("VLLM_H2O_RESIDUAL_LAYERS", ""), always=always,
+                                    method=getattr(speculative_config, "method", None)))
 
 
 def gather_off_reason(parallel_config, compilation_config) -> str | None:

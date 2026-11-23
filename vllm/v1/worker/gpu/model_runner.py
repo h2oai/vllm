@@ -328,8 +328,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._h2o_rows_gpu: torch.Tensor | None = None
         self._h2o_rows_pool = None
         self._h2o_staged: list[str] = []
-        # True when the aux states exist only for the H2O capture: drafters then get none (as without the router)
-        self._h2o_aux_only = False
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
@@ -962,7 +960,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     attn_metadata=attn_metadata,
                     slot_mappings=slot_mappings_by_layer,
                     last_hidden_states=spec_hidden_states,
-                    aux_hidden_states=self._drafter_aux(aux_hidden_states),
+                    aux_hidden_states=aux_hidden_states,
                     num_sampled=torch.ones(
                         input_batch.num_reqs, dtype=torch.int32, device=self.device
                     ),
@@ -1144,6 +1142,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     # ------------------------------------------------------------------ H2O residual router (V2 runner)
     def _h2o_enable_residual_layers(self) -> None:
         """After load_model: ask the model for the residual stream entering the chosen layers (aux hidden states)."""
+        from vllm.v1.worker.h2o_residual import refuse_with_speculative_decoding
+        refuse_with_speculative_decoding(self.h2o_residual_layers, self.speculative_config)   # hard error, first
         if not self.h2o_residual_layers:
             return
         setter = getattr(self.model, "set_aux_hidden_state_layers", None)
@@ -1152,12 +1152,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                            type(self.model).__name__)
             self.h2o_residual_layers = ()
             return
-        from vllm.v1.worker.h2o_residual import REFUSAL, enable_row_gather, gather_off_reason
-        if self.use_aux_hidden_state_outputs:       # a drafter (EAGLE-3, DFlash, ...) reads its own aux layers
-            raise ValueError(REFUSAL.format(method=getattr(self.speculative_config, "method", None)))
+        from vllm.v1.worker.h2o_residual import enable_row_gather, gather_off_reason
         setter(self.h2o_residual_layers)
         self.use_aux_hidden_state_outputs = True
-        self._h2o_aux_only = True                   # drafters that read hidden states keep getting hidden_states
         logger.info("H2O residual router: returning the last-prompt-token residual vector of layers %s on request",
                     self.h2o_residual_layers)
         # Gather-first (only each request's last-prompt-token rows are kept), unless the setup shards or splits the
@@ -1177,10 +1174,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         else:
             logger.warning("H2O residual router: gather-first capture OFF (%s): every token's residual of the "
                            "selected layers is kept per step, O(tokens) memory", reason)
-
-    def _drafter_aux(self, aux_hidden_states):
-        """The aux states a drafter gets: none when they exist only for the H2O router (as without it)."""
-        return None if self._h2o_aux_only else aux_hidden_states
 
     @staticmethod
     def _h2o_wants_features(sampling_params) -> bool:
@@ -2390,7 +2383,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     attn_metadata,
                     slot_mappings_by_layer,
                     spec_hidden_states,
-                    self._drafter_aux(aux_hidden_states),
+                    aux_hidden_states,
                     num_sampled,
                     num_rejected,
                     self.req_states.last_sampled_tokens,

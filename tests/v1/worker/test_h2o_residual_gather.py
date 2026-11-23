@@ -472,10 +472,10 @@ def _fake_runner_for_enable(runner_cls, *, spec_method=None, spec_aux=False, pc=
         max_num_reqs=6,
         device=torch.device("cpu"),
         use_pp=(pc or _pc()).pipeline_parallel_size > 1,
-        _h2o_rows=None, _h2o_rows_gpu=None, _h2o_rows_pool=None, _h2o_aux_only=False,
+        _h2o_rows=None, _h2o_rows_gpu=None, _h2o_rows_pool=None,
     )
     fake.vllm_config = SimpleNamespace(compilation_config=fake.compilation_config)
-    for name in ("_h2o_enable_residual_layers", "_drafter_reads_aux", "_drafter_aux"):
+    for name in ("_h2o_enable_residual_layers",):
         if hasattr(runner_cls, name):
             setattr(fake, name, types.MethodType(getattr(runner_cls, name), fake))
     if hasattr(runner_cls, "_make_buffer"):            # V1: a CpuGpuBuffer, unpinned (no CUDA here)
@@ -496,13 +496,41 @@ def _runner_classes():
     return out
 
 
+SPEC_METHODS = ["mtp", "eagle", "eagle3", "dflash", "dspark", "draft_model", "ngram", "suffix", "medusa",
+                "extract_hidden_states"]
+
+
 @pytest.mark.parametrize("runner_cls", _runner_classes())
-@pytest.mark.parametrize("method", ["eagle3", "dflash", "extract_hidden_states"])
-def test_drafter_reading_aux_states_is_refused(runner_cls, method):
-    fake = _fake_runner_for_enable(runner_cls, spec_method=method, spec_aux=True)
-    with pytest.raises(ValueError, match="VLLM_H2O_RESIDUAL_LAYERS"):
+@pytest.mark.parametrize("method", SPEC_METHODS)
+@pytest.mark.parametrize("drafter_aux", [False, True], ids=["drafter_no_aux", "drafter_aux"])
+def test_any_speculative_decoding_with_capture_is_refused(runner_cls, method, drafter_aux, monkeypatch):
+    monkeypatch.setenv("VLLM_H2O_RESIDUAL_LAYERS", "2,3,5,7")
+    fake = _fake_runner_for_enable(runner_cls, spec_method=method, spec_aux=drafter_aux)
+    with pytest.raises(ValueError, match=r"VLLM_H2O_RESIDUAL_LAYERS.*VLLM_H2O_RESIDUAL_ALWAYS.*speculative"):
         fake._h2o_enable_residual_layers()
-    assert fake.model.model.aux_hidden_state_layers == ()   # nothing changed on the model
+    assert fake.model.model.aux_hidden_state_layers == ()   # refused before anything was set on the model
+    assert getattr(fake.model.model, H2O_ROWS_ATTR, None) is None
+    assert fake.use_aux_hidden_state_outputs is drafter_aux
+
+
+@pytest.mark.parametrize("runner_cls", _runner_classes())
+def test_always_without_layers_plus_spec_is_refused(runner_cls, monkeypatch):
+    monkeypatch.delenv("VLLM_H2O_RESIDUAL_LAYERS", raising=False)
+    monkeypatch.setenv("VLLM_H2O_RESIDUAL_ALWAYS", "1")
+    fake = _fake_runner_for_enable(runner_cls, spec_method="mtp")
+    fake.h2o_residual_layers = ()
+    with pytest.raises(ValueError, match="VLLM_H2O_RESIDUAL_ALWAYS='1'"):
+        fake._h2o_enable_residual_layers()
+
+
+@pytest.mark.parametrize("runner_cls", _runner_classes())
+def test_spec_without_capture_is_untouched(runner_cls, monkeypatch):
+    monkeypatch.delenv("VLLM_H2O_RESIDUAL_LAYERS", raising=False)
+    monkeypatch.delenv("VLLM_H2O_RESIDUAL_ALWAYS", raising=False)
+    fake = _fake_runner_for_enable(runner_cls, spec_method="eagle3", spec_aux=True)
+    fake.h2o_residual_layers = ()
+    fake._h2o_enable_residual_layers()                  # no error, nothing changed
+    assert fake.model.model.aux_hidden_state_layers == () and fake.use_aux_hidden_state_outputs
 
 
 @pytest.fixture
@@ -521,34 +549,29 @@ def _cpu_uva_pool(monkeypatch):
 
 
 @pytest.mark.parametrize("runner_cls", _runner_classes())
-@pytest.mark.parametrize("method", ["mtp", "eagle", "draft_model", None])
-def test_hidden_state_drafters_keep_hidden_states(runner_cls, method, _cpu_uva_pool):
-    """Drafters that read the target's last hidden states (MTP incl. Gemma-4 / Qwen3.5, EAGLE-1, draft model) run
-    with the router: gather-first is on and the drafter is handed no aux states, as without the router."""
-    fake = _fake_runner_for_enable(runner_cls, spec_method=method, spec_aux=False)
+@pytest.mark.parametrize("always", ["", "1"])
+def test_capture_without_spec_gathers(runner_cls, always, _cpu_uva_pool, monkeypatch):
+    monkeypatch.setenv("VLLM_H2O_RESIDUAL_LAYERS", "2,3,5,7")
+    monkeypatch.setenv("VLLM_H2O_RESIDUAL_ALWAYS", always)
+    fake = _fake_runner_for_enable(runner_cls)
     fake._h2o_enable_residual_layers()
-    assert fake.use_aux_hidden_state_outputs and fake._h2o_aux_only
+    assert fake.use_aux_hidden_state_outputs
+    assert fake.model.model.aux_hidden_state_layers == LAYERS
     rows = fake._h2o_rows.gpu if getattr(fake, "_h2o_rows", None) is not None else fake._h2o_rows_gpu
-    assert rows is not None and fake.model.model.h2o_aux_rows is rows
-    aux = [torch.zeros(6, HIDDEN)]
-    if hasattr(fake, "_drafter_reads_aux"):
-        assert fake._drafter_reads_aux() is False           # V1: target_hidden_states = hidden_states[...]
-    if hasattr(fake, "_drafter_aux"):
-        assert fake._drafter_aux(aux) is None               # V2: propose(..., aux_hidden_states=None)
+    assert rows is not None and fake.model.model.h2o_aux_rows is rows and rows.shape == (fake.max_num_reqs,)
 
 
-def test_drafter_call_sites_use_the_h2o_aware_selection():
+def test_no_drafter_plumbing_left():
+    """Capture + spec decode is refused, so the drafter call sites are the upstream ones again."""
     import inspect
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner as V1
-    src = inspect.getsource(V1.propose_draft_token_ids)
-    assert src.count("self._drafter_reads_aux()") == 3
-    assert "if self.use_aux_hidden_state_outputs:\n" not in src
+    assert inspect.getsource(V1.propose_draft_token_ids).count("if self.use_aux_hidden_state_outputs:\n") == 3
+    assert not hasattr(V1, "_drafter_reads_aux")
     try:
         from vllm.v1.worker.gpu.model_runner import GPUModelRunner as V2
     except Exception as e:                              # pragma: no cover
         pytest.skip(f"V2 runner import: {e!r}")
-    v2 = inspect.getsource(V2)
-    assert v2.count("self._drafter_aux(aux_hidden_states)") == 2
+    assert not hasattr(V2, "_drafter_aux")
 
 
 @pytest.mark.parametrize("runner_cls", _runner_classes())
