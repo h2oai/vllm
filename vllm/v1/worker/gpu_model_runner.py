@@ -649,6 +649,8 @@ class GPUModelRunner(
         # request whose prompt completes in the step) instead of every token of the step; None = old full-step path
         self._h2o_rows = None
         self._h2o_staged: list[str] = []
+        # True when the aux states exist only for the H2O capture: drafters then read hidden_states (as without it)
+        self._h2o_aux_only = False
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
@@ -4323,22 +4325,32 @@ class GPUModelRunner(
                            type(self.model).__name__)
             self.h2o_residual_layers = ()
             return
-        spec_uses_aux = self.use_aux_hidden_state_outputs   # a drafter reading every token's aux states
+        from vllm.v1.worker.h2o_residual import REFUSAL, enable_row_gather, gather_off_reason
+        if self.use_aux_hidden_state_outputs:       # a drafter (EAGLE-3, DFlash, ...) reads its own aux layers
+            raise ValueError(REFUSAL.format(method=getattr(self.speculative_config, "method", None)))
         setter(self.h2o_residual_layers)
         self.use_aux_hidden_state_outputs = True
+        self._h2o_aux_only = True                   # drafters that read hidden states keep getting hidden_states
         logger.info("H2O residual router: returning the last-prompt-token residual vector of layers %s on request",
                     self.h2o_residual_layers)
-        # Gather-first: only on a single-stage, non-microbatched, non-PCP runner whose aux states no drafter reads
-        # (there the aux states must stay per token); otherwise the old full-step capture.
-        pc = self.parallel_config
-        if (not spec_uses_aux and pc.pipeline_parallel_size <= 1 and pc.prefill_context_parallel_size <= 1
-                and not pc.use_ubatching):
-            from vllm.v1.worker.h2o_residual import enable_row_gather
+        # Gather-first (only each request's last-prompt-token rows are kept), unless the setup shards or splits the
+        # step's tokens; then the old full-step capture, O(tokens) memory.
+        reason = gather_off_reason(self.parallel_config, self.compilation_config)
+        if reason is None:
             rows = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
             if enable_row_gather(self.model, rows.gpu):
                 self._h2o_rows = rows
-        logger.info("H2O residual router: gather-first capture %s (%d rows)",
-                    "on" if self._h2o_rows is not None else "off", self.max_num_reqs)
+            else:
+                reason = f"model {type(self.model).__name__} does not collect aux states through the mixin"
+        if reason is None:
+            logger.info("H2O residual router: gather-first capture on (%d rows)", self.max_num_reqs)
+        else:
+            logger.warning("H2O residual router: gather-first capture OFF (%s): every token's residual of the "
+                           "selected layers is kept per step, O(tokens) memory", reason)
+
+    def _drafter_reads_aux(self) -> bool:
+        """The drafter's target hidden states are the aux states (EAGLE-3 / DFlash), not the H2O router's."""
+        return self.use_aux_hidden_state_outputs and not self._h2o_aux_only
 
     @staticmethod
     def _h2o_wants_features(req_state) -> bool:
@@ -4391,8 +4403,11 @@ class GPUModelRunner(
             return
         # gathered: the model kept only the staged rows (request k in slot k); a graph that did not gather returns
         # every token's state (more rows than the buffer) and is read by row as before
-        gathered = (self._h2o_rows is not None and len(aux_hidden_states) > 0
-                    and aux_hidden_states[0].shape[0] <= self._h2o_rows.gpu.shape[0])
+        gathered = self._h2o_rows is not None
+        if gathered and aux_hidden_states and aux_hidden_states[0].shape[0] > self._h2o_rows.gpu.shape[0]:
+            logger.warning_once("H2O residual router: the model returned per-token aux states although gather-first "
+                                "is on (a graph compiled without it?); reading them by row")
+            gathered = False
         if gathered and staged != [rid for rid, _ in todo]:
             logger.warning("H2O residual router: staged rows do not match this step's requests; vectors skipped")
             return
@@ -5447,7 +5462,7 @@ class GPUModelRunner(
                 # input_ids can be None for multimodal models.
                 target_token_ids = self.input_ids.gpu[:num_scheduled_tokens]
                 target_positions = self._get_positions(num_scheduled_tokens)
-                if self.use_aux_hidden_state_outputs:
+                if self._drafter_reads_aux():
                     assert aux_hidden_states is not None
                     target_hidden_states = torch.cat(
                         [h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1
@@ -5464,7 +5479,7 @@ class GPUModelRunner(
                     )
                     target_token_ids = self.input_ids.gpu[token_indices]
                     target_positions = self._get_positions(token_indices)
-                    if self.use_aux_hidden_state_outputs:
+                    if self._drafter_reads_aux():
                         assert aux_hidden_states is not None
                         target_hidden_states = torch.cat(
                             [h[token_indices] for h in aux_hidden_states], dim=-1
@@ -5485,7 +5500,7 @@ class GPUModelRunner(
                     # When padding the batch, token_indices is just a range
                     target_token_ids = self.input_ids.gpu[:total_num_tokens]
                     target_positions = self._get_positions(total_num_tokens)
-                    if self.use_aux_hidden_state_outputs:
+                    if self._drafter_reads_aux():
                         assert aux_hidden_states is not None
                         target_hidden_states = torch.cat(
                             [h[:total_num_tokens] for h in aux_hidden_states], dim=-1

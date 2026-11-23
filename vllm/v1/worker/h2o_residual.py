@@ -66,6 +66,27 @@ def enable_row_gather(model: torch.nn.Module, rows: torch.Tensor) -> bool:
     return True
 
 
+REFUSAL = (
+    "H2O residual router (VLLM_H2O_RESIDUAL_LAYERS / VLLM_H2O_RESIDUAL_ALWAYS) cannot run with the "
+    "speculative method {method!r}: that drafter reads the target model's aux hidden states of its own layers, "
+    "which the router would replace. Unset VLLM_H2O_RESIDUAL_LAYERS or use another speculative method."
+)
+
+
+def gather_off_reason(parallel_config, compilation_config) -> str | None:
+    """Why gather-first cannot run in this setup (None: it can). Without it the capture keeps every token's state."""
+    if parallel_config.pipeline_parallel_size > 1:
+        return "pipeline parallel"
+    if parallel_config.prefill_context_parallel_size > 1:
+        return "prefill context parallel"
+    if parallel_config.use_ubatching:
+        return "microbatching (DBO)"
+    pass_config = getattr(compilation_config, "pass_config", None)
+    if parallel_config.tensor_parallel_size > 1 and bool(getattr(pass_config, "enable_sp", False)):
+        return "sequence parallelism (pass_config.enable_sp, residual sharded by token)"
+    return None
+
+
 def gather_vectors(
     aux_hidden_states: Sequence[torch.Tensor],
     todo: Sequence[tuple[str, int]],

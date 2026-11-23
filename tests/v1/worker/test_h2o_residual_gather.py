@@ -410,3 +410,181 @@ def test_served_families_collect_through_the_mixin(modpath, clsname):
     cls = getattr(mod, clsname)
     assert issubclass(cls, EagleModelMixin)
     assert collects_through_mixin(cls)
+
+
+# ----------------------------------------------------------------------------- review fixes (rel27, 11-22)
+def _pc(pp=1, pcp=1, tp=1, ubatch=False):
+    return SimpleNamespace(pipeline_parallel_size=pp, prefill_context_parallel_size=pcp, tensor_parallel_size=tp,
+                           use_ubatching=ubatch)
+
+
+def _cc(enable_sp=False):
+    return SimpleNamespace(pass_config=SimpleNamespace(enable_sp=enable_sp))
+
+
+def test_gather_off_reasons():
+    from vllm.v1.worker.h2o_residual import gather_off_reason
+    assert gather_off_reason(_pc(), _cc()) is None
+    assert gather_off_reason(_pc(tp=4), _cc()) is None                  # TP without SP: full tokens per rank
+    assert gather_off_reason(_pc(tp=1), _cc(enable_sp=True)) is None    # SP pass is a no-op at TP=1
+    assert "sequence parallel" in gather_off_reason(_pc(tp=2), _cc(enable_sp=True))
+    assert "pipeline" in gather_off_reason(_pc(pp=2), _cc())
+    assert "context parallel" in gather_off_reason(_pc(pcp=2), _cc())
+    assert "microbatching" in gather_off_reason(_pc(ubatch=True), _cc())
+
+
+def test_env_vars_are_compile_factors(monkeypatch):
+    import vllm.envs as envs
+    from vllm.config.utils import hash_factors
+    monkeypatch.delenv("VLLM_H2O_RESIDUAL_LAYERS", raising=False)
+    monkeypatch.delenv("VLLM_H2O_RESIDUAL_ALWAYS", raising=False)
+    off = envs.compile_factors()
+    assert "VLLM_H2O_RESIDUAL_LAYERS" in off and "VLLM_H2O_RESIDUAL_ALWAYS" in off
+    h_off = hash_factors(off)
+    monkeypatch.setenv("VLLM_H2O_RESIDUAL_LAYERS", "21,32,43,53")
+    h_on = hash_factors(envs.compile_factors())
+    monkeypatch.setenv("VLLM_H2O_RESIDUAL_LAYERS", "20,30,40,50")
+    h_other = hash_factors(envs.compile_factors())
+    monkeypatch.setenv("VLLM_H2O_RESIDUAL_ALWAYS", "1")
+    h_always = hash_factors(envs.compile_factors())
+    assert len({h_off, h_on, h_other, h_always}) == 4
+
+
+class _Outer(nn.Module):
+    """An outer model with the setter the runners call, over the toy inner model."""
+
+    def __init__(self, inner=None):
+        super().__init__()
+        self.model = inner if inner is not None else ToyModel()
+
+    def set_aux_hidden_state_layers(self, layers):
+        self.model._set_aux_hidden_state_layers(layers)
+
+
+def _fake_runner_for_enable(runner_cls, *, spec_method=None, spec_aux=False, pc=None, cc=None, model=None):
+    fake = SimpleNamespace(
+        model=model if model is not None else _Outer(),
+        h2o_residual_layers=LAYERS,
+        use_aux_hidden_state_outputs=spec_aux,
+        speculative_config=None if spec_method is None else SimpleNamespace(method=spec_method),
+        parallel_config=pc or _pc(),
+        compilation_config=cc or _cc(),
+        max_num_reqs=6,
+        device=torch.device("cpu"),
+        use_pp=(pc or _pc()).pipeline_parallel_size > 1,
+        _h2o_rows=None, _h2o_rows_gpu=None, _h2o_rows_pool=None, _h2o_aux_only=False,
+    )
+    fake.vllm_config = SimpleNamespace(compilation_config=fake.compilation_config)
+    for name in ("_h2o_enable_residual_layers", "_drafter_reads_aux", "_drafter_aux"):
+        if hasattr(runner_cls, name):
+            setattr(fake, name, types.MethodType(getattr(runner_cls, name), fake))
+    if hasattr(runner_cls, "_make_buffer"):            # V1: a CpuGpuBuffer, unpinned (no CUDA here)
+        from vllm.v1.utils import CpuGpuBuffer
+        fake._make_buffer = lambda *size, dtype, numpy=True: CpuGpuBuffer(
+            *size, dtype=dtype, device=torch.device("cpu"), pin_memory=False, with_numpy=numpy)
+    return fake
+
+
+def _runner_classes():
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner as V1
+    out = [pytest.param(V1, id="v1")]
+    try:
+        from vllm.v1.worker.gpu.model_runner import GPUModelRunner as V2
+        out.append(pytest.param(V2, id="v2"))
+    except Exception as e:                              # pragma: no cover
+        out.append(pytest.param(None, id="v2", marks=pytest.mark.skip(reason=f"V2 runner import: {e!r}")))
+    return out
+
+
+@pytest.mark.parametrize("runner_cls", _runner_classes())
+@pytest.mark.parametrize("method", ["eagle3", "dflash", "extract_hidden_states"])
+def test_drafter_reading_aux_states_is_refused(runner_cls, method):
+    fake = _fake_runner_for_enable(runner_cls, spec_method=method, spec_aux=True)
+    with pytest.raises(ValueError, match="VLLM_H2O_RESIDUAL_LAYERS"):
+        fake._h2o_enable_residual_layers()
+    assert fake.model.model.aux_hidden_state_layers == ()   # nothing changed on the model
+
+
+@pytest.fixture
+def _cpu_uva_pool(monkeypatch):
+    """V2 stages rows through a UvaBufferPool (pinned/UVA, GPU only); a plain stand-in on CPU."""
+    import vllm.v1.worker.gpu.buffer_utils as bu
+
+    class _Pool:
+        def __init__(self, size, dtype, max_concurrency=None):
+            pass
+
+        def copy_to_gpu(self, x, out=None):
+            return out.copy_(torch.as_tensor(x))
+
+    monkeypatch.setattr(bu, "UvaBufferPool", _Pool)
+
+
+@pytest.mark.parametrize("runner_cls", _runner_classes())
+@pytest.mark.parametrize("method", ["mtp", "eagle", "draft_model", None])
+def test_hidden_state_drafters_keep_hidden_states(runner_cls, method, _cpu_uva_pool):
+    """Drafters that read the target's last hidden states (MTP incl. Gemma-4 / Qwen3.5, EAGLE-1, draft model) run
+    with the router: gather-first is on and the drafter is handed no aux states, as without the router."""
+    fake = _fake_runner_for_enable(runner_cls, spec_method=method, spec_aux=False)
+    fake._h2o_enable_residual_layers()
+    assert fake.use_aux_hidden_state_outputs and fake._h2o_aux_only
+    rows = fake._h2o_rows.gpu if getattr(fake, "_h2o_rows", None) is not None else fake._h2o_rows_gpu
+    assert rows is not None and fake.model.model.h2o_aux_rows is rows
+    aux = [torch.zeros(6, HIDDEN)]
+    if hasattr(fake, "_drafter_reads_aux"):
+        assert fake._drafter_reads_aux() is False           # V1: target_hidden_states = hidden_states[...]
+    if hasattr(fake, "_drafter_aux"):
+        assert fake._drafter_aux(aux) is None               # V2: propose(..., aux_hidden_states=None)
+
+
+def test_drafter_call_sites_use_the_h2o_aware_selection():
+    import inspect
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner as V1
+    src = inspect.getsource(V1.propose_draft_token_ids)
+    assert src.count("self._drafter_reads_aux()") == 3
+    assert "if self.use_aux_hidden_state_outputs:\n" not in src
+    try:
+        from vllm.v1.worker.gpu.model_runner import GPUModelRunner as V2
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"V2 runner import: {e!r}")
+    v2 = inspect.getsource(V2)
+    assert v2.count("self._drafter_aux(aux_hidden_states)") == 2
+
+
+@pytest.mark.parametrize("runner_cls", _runner_classes())
+@pytest.mark.parametrize("pc,cc,why", [
+    (_pc(pp=2), _cc(), "pipeline"),
+    (_pc(tp=2), _cc(enable_sp=True), "sequence parallel"),
+    (_pc(ubatch=True), _cc(), "microbatching"),
+])
+def test_gather_off_logs_a_warning(runner_cls, pc, cc, why, monkeypatch):
+    import importlib
+    mod = importlib.import_module(runner_cls.__module__)
+    calls = {"warning": [], "info": []}
+    fake_logger = SimpleNamespace(
+        warning=lambda msg, *a: calls["warning"].append(msg % a),
+        info=lambda msg, *a: calls["info"].append(msg % a),
+    )
+    monkeypatch.setattr(mod, "logger", fake_logger)
+    fake = _fake_runner_for_enable(runner_cls, pc=pc, cc=cc)
+    fake._h2o_enable_residual_layers()
+    assert getattr(fake, "_h2o_rows", None) is None and getattr(fake, "_h2o_rows_gpu", None) is None
+    assert getattr(fake.model.model, H2O_ROWS_ATTR, None) is None
+    assert any("gather-first capture OFF" in m and why in m for m in calls["warning"]), calls
+
+
+@pytest.mark.parametrize("runner_cls", _runner_classes())
+def test_model_without_mixin_collection_logs_a_warning(runner_cls, monkeypatch):
+    import importlib
+    mod = importlib.import_module(runner_cls.__module__)
+    warnings = []
+    monkeypatch.setattr(mod, "logger", SimpleNamespace(warning=lambda m, *a: warnings.append(m % a),
+                                                       info=lambda m, *a: None))
+
+    class Custom(nn.Module, EagleModelMixin):
+        def forward(self, x):
+            return x, [x]
+
+    fake = _fake_runner_for_enable(runner_cls, model=_Outer(Custom()))
+    fake._h2o_enable_residual_layers()
+    assert any("gather-first capture OFF" in m and "mixin" in m for m in warnings)

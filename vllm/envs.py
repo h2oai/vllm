@@ -271,6 +271,8 @@ if TYPE_CHECKING:
     VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC: bool = False
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
+    VLLM_H2O_RESIDUAL_LAYERS: str = ""
+    VLLM_H2O_RESIDUAL_ALWAYS: str = ""
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
     VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT: bool = False
     VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS: bool = False
@@ -1905,6 +1907,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ENABLE_STARTUP_PLAN": lambda: bool(
         int(os.getenv("VLLM_ENABLE_STARTUP_PLAN", "0"))
     ),
+    # H2O residual router: the layers whose residual stream at the last prompt
+    # token is returned with each response (comma-separated), and "1" to return
+    # it for every request. Registered here so compile_factors() hashes them:
+    # the layer list (and capture on/off) changes the compiled graph's outputs.
+    # The runners read them from os.environ directly.
+    "VLLM_H2O_RESIDUAL_LAYERS": lambda: os.getenv("VLLM_H2O_RESIDUAL_LAYERS", ""),
+    "VLLM_H2O_RESIDUAL_ALWAYS": lambda: os.getenv("VLLM_H2O_RESIDUAL_ALWAYS", ""),
     # Valid values are container,code_interpreter,web_search_preview
     # ex VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS=container,code_interpreter
     # If the server_label of your mcp tool is not in this list it will
